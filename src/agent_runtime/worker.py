@@ -28,6 +28,7 @@ from claude_agent_sdk import (
 )
 from filelock import FileLock
 
+from agent_runtime.monitors import Monitors
 from agent_runtime.store import Store
 
 log = logging.getLogger(__name__)
@@ -244,6 +245,10 @@ class Worker:
                     and self.active is None
                     and not self.background_tasks
                     and time.monotonic() - self.last_activity >= timeout
+                    and not any(
+                        monitor["status"] in {"starting", "running"}
+                        for monitor in Monitors().list(self.session_id)
+                    )
                 ):
                     result = {"status": "completed", "reason": "idle_timeout"}
                     break
