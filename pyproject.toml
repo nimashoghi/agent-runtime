@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-runtime-py"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reconnectable native agent workers with durable input receipts and events"
 readme = "README.md"
 license = "MIT"
@@ -15,7 +15,7 @@ dependencies = [
   "filelock>=3.16,<4",
   "platformdirs>=4,<5",
   "psutil>=7,<8",
-  "typed-agent-hooks>=0.2.2,<0.3",
+  "typed-agent-hooks",
 ]
 
 [project.scripts]

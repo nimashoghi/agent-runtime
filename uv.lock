@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-runtime-py"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
@@ -34,7 +34,7 @@ requires-dist = [
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
     { name = "psutil", specifier = ">=7,<8" },
-    { name = "typed-agent-hooks", specifier = ">=0.2.2,<0.3" },
+    { name = "typed-agent-hooks" },
 ]
 
 [package.metadata.requires-dev]
