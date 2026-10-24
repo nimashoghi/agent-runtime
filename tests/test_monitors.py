@@ -1,6 +1,8 @@
 """Real detached shell monitors and native inbox frames at a local socket boundary."""
 
 import json
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -50,7 +52,7 @@ def inbox(tmp_path, monkeypatch):
                         data += block
                     frames.append([json.loads(line) for line in data.splitlines()])
 
-        thread = threading.Thread(target=receive)
+        thread = threading.Thread(target=receive, daemon=True)
         thread.start()
         owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
         sid = str(uuid.uuid4())
@@ -73,18 +75,30 @@ def inbox(tmp_path, monkeypatch):
         try:
             yield monitors, sid, frames, owner, bridge
         finally:
-            for monitor in monitors.list(sid):
-                monitors.stop(monitor["monitor_id"])
-            wait_for(
-                lambda: all(m["status"] not in {"starting", "running"} for m in monitors.list(sid))
-            )
-            if owner.poll() is None:
-                owner.terminate()
-            owner.wait(timeout=5)
-            bridge.wait(timeout=15)
-            stopped.set()
-            thread.join(timeout=2)
-            sock.close()
+            try:
+                for monitor in monitors.list(sid):
+                    monitors.stop(monitor["monitor_id"])
+                wait_for(
+                    lambda: all(
+                        m["status"] not in {"starting", "running"} for m in monitors.list(sid)
+                    )
+                )
+                # Every worker must exit. Kill a stuck one so that a failing
+                # test does not leave it running, then fail.
+                for monitor in monitors.list(sid):
+                    try:
+                        wait_for(lambda m=monitor: not process_alive(m))
+                    finally:
+                        if process_alive(monitor):
+                            os.kill(monitor["pid"], signal.SIGKILL)
+            finally:
+                if owner.poll() is None:
+                    owner.terminate()
+                owner.wait(timeout=5)
+                bridge.wait(timeout=15)
+                stopped.set()
+                thread.join(timeout=2)
+                sock.close()
 
 
 def test_shell_output_failure_and_truthful_peer_mode(inbox):
@@ -190,3 +204,25 @@ def test_excessive_output_stops_with_inspectable_error(inbox):
         lambda: m if (m := monitors.get(monitor["monitor_id"]))["status"] == "failed" else None
     )
     assert "exceeded 1 MiB" in done["error"]
+    # The unread output must not keep the worker waiting for its command.
+    wait_for(lambda: not process_alive(done))
+
+
+def test_worker_stops_its_command_and_exits_on_sigterm(inbox, tmp_path):
+    monitors, _sid, _, _, _ = inbox
+    pidfile = tmp_path / "command.pid"
+    monitor = monitors.start(
+        f"echo $$ > {pidfile}; exec sleep 300", description="sigterm", persistent=True
+    )
+    wait_for(pidfile.exists)
+    command = psutil.Process(int(pidfile.read_text()))
+    command_identity = {"pid": command.pid, "process_created_at": command.create_time()}
+    worker = wait_for(
+        lambda: m if (m := monitors.get(monitor["monitor_id"]))["status"] == "running" else None
+    )
+
+    os.kill(worker["pid"], signal.SIGTERM)
+
+    wait_for(lambda: not process_alive(worker))
+    assert not process_alive(command_identity)
+    assert monitors.get(monitor["monitor_id"])["status"] == "stopped"

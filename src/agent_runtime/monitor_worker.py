@@ -14,6 +14,19 @@ from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
 
 
+async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
+    """Wait until the child exits, but not for its pipes to close.
+
+    `Process.wait()` called before the child exits returns only after stdout
+    and stderr close. After the output limit stops a reader, the unread pipe
+    never closes, so the worker waited forever and ignored SIGTERM.
+    """
+    deadline = time.monotonic() + timeout
+    while child.returncode is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    return child.returncode is not None
+
+
 async def run(directory: Path, identity: str) -> None:
     monitors = Monitors(directory)
     value = monitors.get(identity)
@@ -93,17 +106,16 @@ async def run(directory: Path, identity: str) -> None:
             if stop.is_set():
                 if process_alive({"pid": child.pid, "process_created_at": child_created}):
                     os.killpg(child.pid, signal.SIGTERM)
-                    try:
-                        await asyncio.wait_for(child.wait(), timeout=5)
-                    except TimeoutError:
-                        if process_alive({"pid": child.pid, "process_created_at": child_created}):
-                            os.killpg(child.pid, signal.SIGKILL)
+                    if not await exited(child, 5) and process_alive(
+                        {"pid": child.pid, "process_created_at": child_created}
+                    ):
+                        os.killpg(child.pid, signal.SIGKILL)
+                        await exited(child, 5)
                 break
             for reader in readers:
                 if reader.done() and (error := reader.exception()) is not None:
                     raise error
             await asyncio.sleep(0.1)
-        await child.wait()
         try:
             await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
         except TimeoutError as error:
@@ -134,7 +146,7 @@ async def run(directory: Path, identity: str) -> None:
         if child is not None and child.returncode is None:
             if process_alive({"pid": child.pid, "process_created_at": child_created}):
                 os.killpg(child.pid, signal.SIGKILL)
-            await child.wait()
+            await exited(child, 5)
         for reader in readers:
             reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)

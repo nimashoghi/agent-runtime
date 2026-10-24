@@ -1,6 +1,6 @@
 # Agent runtime
 
-`agent-runtime-py` provides detached Claude Code workers that applications can reconnect to after restarting. Import it as `agent_runtime`. It uses the official Claude Agent SDK and your installed Claude Code executable, loading native user and project settings, hooks, skills, and MCP servers.
+`agent-runtime-py` provides detached Claude Code workers that applications can reconnect to after restarting. Import it as `agent_runtime`. The workers need the `claude` extra (`agent-runtime-py[claude]`), which installs the Claude Agent SDK; the hooks, monitors and peer messages do not. It uses the official Claude Agent SDK and your installed Claude Code executable, loading native user and project settings, hooks, skills, and MCP servers.
 
 This repository is under active development. The current implementation supports macOS and Linux and has been exercised with Claude Code 2.1.281 and Claude Agent SDK 0.2.159. Windows is not supported.
 
@@ -34,7 +34,7 @@ The default permission mode is Claude's ordinary permission behavior. Pending ap
 
 ## Monitors and local peer messages
 
-Run the hooks from an executable PEP 723 script with an exact `agent-runtime-py` pin and a `[tool.uv] exclude-newer` date, whose body is `from agent_runtime.hooks import app; app.main()`. Register that script for SessionStart, UserPromptSubmit and PreToolUse in each host's hook file, with the host name (`codex` or `claude`) as its only argument and a timeout of 10 seconds. The hooks register native process identities and current permission modes. Claude hooks start a private delivery child whose inherited native inbox token remains in memory; it is never written to the registry or used for messages to another session.
+Run the hooks from an executable PEP 723 script with an exact `agent-runtime-py` pin and a `[tool.uv] exclude-newer` date, whose body is `from agent_runtime.hooks import app; app.main()`. Register that script for SessionStart, UserPromptSubmit and PreToolUse in each host's hook file, with the host name (`codex` or `claude`) as its only argument and a timeout of 10 seconds. End each command with `|| true`: when uv cannot start the script it exits 2, and both hosts read exit 2 on UserPromptSubmit and PreToolUse as a block. The hooks register native process identities and current permission modes. Claude hooks start a private delivery child whose inherited native inbox token remains in memory; it is never written to the registry or used for messages to another session.
 
 `agent_runtime.operations` supplies `monitor_start`, `monitor_list`, `monitor_get`, `monitor_stop`, `monitor_events`, `agents`, and `send`. Codex operations delegate to the installed `codexr` CLI. Claude monitors run a detached foreground Bash command and retain stdout observations in SQLite; stderr goes to a private log. A 1 MiB output limit stops an overly verbose monitor. Delivery batches retain each monitor's launch permission class. Native Claude receives these as peer context and applies its own admission policy, including holding messages if permission modes require approval. `transport-written` confirms only a socket write, not admission or model processing. Interrupted writes remain uncertain and are not replayed automatically.
 

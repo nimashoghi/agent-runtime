@@ -12,15 +12,20 @@ name = "agent-runtime-py"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "claude-agent-sdk" },
     { name = "filelock" },
     { name = "platformdirs" },
     { name = "psutil" },
     { name = "typed-agent-hooks" },
 ]
 
+[package.optional-dependencies]
+claude = [
+    { name = "claude-agent-sdk" },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "agent-runtime-py", extra = ["claude"] },
     { name = "basedpyright" },
     { name = "build" },
     { name = "pytest" },
@@ -30,15 +35,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", specifier = "==0.2.159" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = "==0.2.159" },
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
     { name = "psutil", specifier = ">=7,<8" },
-    { name = "typed-agent-hooks", git = "https://github.com/nimashoghi/typed-agent-hooks?rev=e7a994fc8d7079199159ec20930d66a191442f8a" },
+    { name = "typed-agent-hooks", git = "https://github.com/nimashoghi/typed-agent-hooks?rev=9093a5e76b2e122dd9b2e6fea728246af04e00b8" },
 ]
+provides-extras = ["claude"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "agent-runtime-py", extras = ["claude"] },
     { name = "basedpyright", specifier = ">=1.31,<2" },
     { name = "build", specifier = ">=1.3,<2" },
     { name = "pytest", specifier = ">=8.4,<9" },
@@ -944,7 +951,7 @@ wheels = [
 [[package]]
 name = "typed-agent-hooks"
 version = "0.3.0"
-source = { git = "https://github.com/nimashoghi/typed-agent-hooks?rev=e7a994fc8d7079199159ec20930d66a191442f8a#e7a994fc8d7079199159ec20930d66a191442f8a" }
+source = { git = "https://github.com/nimashoghi/typed-agent-hooks?rev=9093a5e76b2e122dd9b2e6fea728246af04e00b8#9093a5e76b2e122dd9b2e6fea728246af04e00b8" }
 dependencies = [
     { name = "pydantic" },
 ]

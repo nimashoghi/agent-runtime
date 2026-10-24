@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -77,6 +78,8 @@ class ClaudeRuntime:
     """The client owns no worker lifetime and can reconnect after a service restart."""
 
     def __init__(self, directory: Path) -> None:
+        if importlib.util.find_spec("claude_agent_sdk") is None:
+            raise RuntimeError("ClaudeRuntime needs the claude extra: agent-runtime-py[claude]")
         self.store = Store(directory)
 
     def inspect(self, execution_id: str) -> dict[str, Any]:

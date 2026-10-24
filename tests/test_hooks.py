@@ -63,7 +63,6 @@ def test_subagent_events_do_not_register(tmp_path, monkeypatch, host):
     monkeypatch.delenv("CLAUDE_PID", raising=False)
     payload = codex_payload("PreToolUse", "parent", agent_id="a", agent_type="explore")
     if host == "claude":
-        del payload["model"], payload["turn_id"]
         payload["transcript_path"] = str(tmp_path / "t.jsonl")
 
     assert app.handle(host, payload) is None
@@ -123,7 +122,6 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             assert process_alive(bridge)
 
             prompt = {**payload, "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
-            del prompt["source"], prompt["model"]
             assert app.handle("claude", prompt) is None
             assert registry.get("claude_code", session_id)["bridge"] == bridge
     finally:
