@@ -21,9 +21,9 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/nimashoghi/agent-runtime"
 
-# Until typed-agent-hooks 0.3.0 is on PyPI. `uv build --no-sources` ignores this table.
+# Delete after typed-agent-hooks 0.3.0 is on PyPI, then run `uv lock`.
 [tool.uv.sources]
-typed-agent-hooks = { git = "https://github.com/nimashoghi/typed-agent-hooks", rev = "38f4f4a4682f74ca902ab71c68a22d868b1a9d0a" }
+typed-agent-hooks = { git = "https://github.com/nimashoghi/typed-agent-hooks", rev = "e7a994fc8d7079199159ec20930d66a191442f8a" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runtime"]

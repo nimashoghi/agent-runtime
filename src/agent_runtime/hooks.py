@@ -65,6 +65,3 @@ def register(
 app.on(shared.events.SessionStarted)(register)
 app.on(shared.events.PromptSubmitted)(register)
 app.on(shared.events.ToolCallProposed)(register)
-
-if __name__ == "__main__":
-    app.main()

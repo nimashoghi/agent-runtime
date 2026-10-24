@@ -76,7 +76,7 @@ def test_subagent_events_do_not_register(tmp_path, monkeypatch, host):
 def test_hook_command_reads_host_argument_and_stdin(tmp_path):
     session_id = str(uuid.uuid4())
     result = subprocess.run(
-        [sys.executable, "-m", "agent_runtime.hooks", "codex"],
+        [sys.executable, "-c", "from agent_runtime.hooks import app; app.main()", "codex"],
         input=json.dumps(codex_payload("SessionStart", session_id)),
         env={"AGENT_RUNTIME_DIRECTORY": str(tmp_path), "PATH": "/usr/bin:/bin"},
         capture_output=True,
@@ -117,7 +117,8 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
 
             assert app.handle("claude", payload) is None
             registry = Registry(tmp_path)
-            bridge = wait_for(lambda: registry.get("claude_code", session_id).get("bridge"))
+            # The hook records the bridge before it returns.
+            bridge = registry.get("claude_code", session_id)["bridge"]
             assert bridge["native_pid"] == owner.pid
             assert process_alive(bridge)
 
