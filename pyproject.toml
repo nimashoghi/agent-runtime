@@ -18,9 +18,6 @@ dependencies = [
   "typed-agent-hooks>=0.3,<0.4",
 ]
 
-[project.scripts]
-agent-runtime-hooks = "agent_runtime.hooks:main"
-
 [project.urls]
 Repository = "https://github.com/nimashoghi/agent-runtime"
 

@@ -62,24 +62,9 @@ def register(
         )
 
 
-@app.on(shared.events.SessionStarted)
-def session_started(event: shared.events.SessionStarted) -> None:
-    register(event)
-
-
-@app.on(shared.events.PromptSubmitted)
-def prompt_submitted(event: shared.events.PromptSubmitted) -> None:
-    register(event)
-
-
-@app.on(shared.events.ToolCallProposed)
-def tool_call_proposed(event: shared.events.ToolCallProposed) -> None:
-    register(event)
-
-
-def main() -> None:
-    app.main()
-
+app.on(shared.events.SessionStarted)(register)
+app.on(shared.events.PromptSubmitted)(register)
+app.on(shared.events.ToolCallProposed)(register)
 
 if __name__ == "__main__":
-    main()
+    app.main()

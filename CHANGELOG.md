@@ -2,4 +2,4 @@
 
 ## 0.2.0
 
-- Breaking: requires typed-agent-hooks 0.3. The hook command is `agent-runtime-hooks codex|claude`, and the host hook file sets the timeout (typed-agent-hooks 0.3 has no `timeout` argument).
+- Breaking: requires typed-agent-hooks 0.3. Run the hooks with `agent_runtime.hooks.app.main()` and the host name (`codex` or `claude`) as the only argument; the host hook file sets the timeout. The `agent-runtime-hooks` console script is removed.
