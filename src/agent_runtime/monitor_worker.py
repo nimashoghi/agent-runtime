@@ -116,6 +116,8 @@ async def run(directory: Path, identity: str) -> None:
                 if reader.done() and (error := reader.exception()) is not None:
                     raise error
             await asyncio.sleep(0.1)
+        # Stop can win the race with a normal exit; record the exit code then too.
+        await exited(child, 5)
         try:
             await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
         except TimeoutError as error:

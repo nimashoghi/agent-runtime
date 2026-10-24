@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 import psutil
@@ -75,30 +76,27 @@ def inbox(tmp_path, monkeypatch):
         try:
             yield monitors, sid, frames, owner, bridge
         finally:
-            try:
-                for monitor in monitors.list(sid):
-                    monitors.stop(monitor["monitor_id"])
-                wait_for(
-                    lambda: all(
-                        m["status"] not in {"starting", "running"} for m in monitors.list(sid)
-                    )
-                )
-                # Every worker must exit. Kill a stuck one so that a failing
-                # test does not leave it running, then fail.
-                for monitor in monitors.list(sid):
-                    try:
-                        wait_for(lambda m=monitor: not process_alive(m))
-                    finally:
-                        if process_alive(monitor):
-                            os.kill(monitor["pid"], signal.SIGKILL)
-            finally:
-                if owner.poll() is None:
-                    owner.terminate()
-                owner.wait(timeout=5)
-                bridge.wait(timeout=15)
-                stopped.set()
-                thread.join(timeout=2)
-                sock.close()
+            for monitor in monitors.list(sid):
+                monitors.stop(monitor["monitor_id"])
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and any(map(process_alive, monitors.list(sid))):
+                time.sleep(0.05)
+            # Kill a stuck worker and its command, so that a failing test leaks
+            # no process, and fail after the rest of the cleanup.
+            stuck = [m for m in monitors.list(sid) if process_alive(m)]
+            for monitor in stuck:
+                worker = psutil.Process(monitor["pid"])
+                for process in [*worker.children(recursive=True), worker]:
+                    with suppress(psutil.NoSuchProcess):
+                        process.kill()
+            if owner.poll() is None:
+                owner.terminate()
+            owner.wait(timeout=5)
+            bridge.wait(timeout=15)
+            stopped.set()
+            thread.join(timeout=2)
+            sock.close()
+            assert not stuck, f"monitor workers did not exit: {[m['monitor_id'] for m in stuck]}"
 
 
 def test_shell_output_failure_and_truthful_peer_mode(inbox):
