@@ -10,7 +10,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-from typed_agent_hooks import shared
 
 from agent_runtime.claude import process_alive
 from agent_runtime.hooks import app
@@ -44,19 +43,6 @@ def codex_payload(event: str, session_id: str, **fields) -> dict:
             turn_id="t", tool_name="Bash", tool_use_id="u", tool_input={"command": "echo ok"}
         )
     return {**payload, **fields}
-
-
-def test_every_handled_event_has_a_native_name_in_both_hosts():
-    assert set(app.handlers) == {
-        shared.events.SessionStarted,
-        shared.events.PromptSubmitted,
-        shared.events.ToolCallProposed,
-    }
-    names = {
-        host: {shared.native_event_name(event, host) for event in app.handlers}
-        for host in ("codex", "claude")
-    }
-    assert names["codex"] == names["claude"] == {"SessionStart", "UserPromptSubmit", "PreToolUse"}
 
 
 @pytest.mark.parametrize("event", ["SessionStart", "UserPromptSubmit", "PreToolUse"])

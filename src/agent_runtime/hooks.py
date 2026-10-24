@@ -1,9 +1,4 @@
-"""Register live identities and maintain the native monitor-delivery child.
-
-Register ``agent-runtime-hooks codex`` or ``agent-runtime-hooks claude`` in the
-host's hook file for SessionStart, UserPromptSubmit and PreToolUse. The host
-file also sets the timeout (10 seconds is enough).
-"""
+"""Register live identities and maintain the native monitor-delivery child."""
 
 import os
 import subprocess
