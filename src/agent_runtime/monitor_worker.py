@@ -18,8 +18,7 @@ async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
     """Wait until the child exits, but not for its pipes to close.
 
     `Process.wait()` called before the child exits returns only after stdout
-    and stderr close. After the output limit stops a reader, the unread pipe
-    never closes, so the worker waited forever and ignored SIGTERM.
+    and stderr close, and a pipe that no reader drains never closes.
     """
     deadline = time.monotonic() + timeout
     while child.returncode is None and time.monotonic() < deadline:

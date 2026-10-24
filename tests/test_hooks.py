@@ -13,7 +13,7 @@ import pytest
 
 from agent_runtime.claude import process_alive
 from agent_runtime.hooks import app
-from agent_runtime.sessions import Registry
+from agent_runtime.sessions import Registry, own_claude_registration
 
 
 def wait_for(predicate, timeout=15):
@@ -143,3 +143,22 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
         owner.wait(timeout=5)
     # The bridge exits when its native owner exits.
     wait_for(lambda: not process_alive(bridge))
+
+
+def test_permission_mode_belongs_to_the_native_process(tmp_path, monkeypatch):
+    registry = Registry(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_MESSAGING_SOCKET", str(tmp_path / "inbox.sock"))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    sleeper = [sys.executable, "-c", "import time; time.sleep(300)"]
+    with subprocess.Popen(sleeper) as first:
+        monkeypatch.setenv("CLAUDE_PID", str(first.pid))
+        own_claude_registration("s", "/repo", "default", registry=registry)
+        # SessionStart after compaction: same process, no mode in the payload.
+        own_claude_registration("s", "/repo", None, registry=registry)
+        assert registry.get("claude_code", "s")["permission_mode"] == "default"
+        first.terminate()
+    with subprocess.Popen(sleeper) as resumed:
+        monkeypatch.setenv("CLAUDE_PID", str(resumed.pid))
+        own_claude_registration("s", "/repo", None, registry=registry)
+        assert registry.get("claude_code", "s")["permission_mode"] is None
+        resumed.terminate()

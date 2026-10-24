@@ -114,16 +114,24 @@ def own_claude_registration(
     process = psutil.Process(pid)
     if process.uids().real != os.getuid():
         raise RuntimeError("native Claude process belongs to a different user")
-    # Claude's SessionStart payload has no permission mode; keep the known one.
-    mode = {} if permission_mode is None else {"permission_mode": permission_mode}
-    return (registry or Registry()).update(
+    registry = registry or Registry()
+    identity = {"pid": pid, "process_created_at": process.create_time()}
+    # Claude's SessionStart payload has no permission mode. Keep the mode that
+    # this same process reported; a resumed session in a new process has none.
+    if permission_mode is None:
+        try:
+            previous = registry.get("claude_code", session_id)
+        except KeyError:
+            previous = {}
+        if {key: previous.get(key) for key in identity} == identity:
+            permission_mode = previous.get("permission_mode")
+    return registry.update(
         "claude_code",
         session_id,
         cwd=cwd,
-        pid=pid,
-        process_created_at=process.create_time(),
+        permission_mode=permission_mode,
         socket=os.environ["CLAUDE_CODE_MESSAGING_SOCKET"],
-        **mode,
+        **identity,
     )
 
 
