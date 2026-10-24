@@ -1,4 +1,9 @@
-"""Register live identities and maintain the native monitor-delivery child."""
+"""Register live identities and maintain the native monitor-delivery child.
+
+Register ``agent-runtime-hooks codex`` or ``agent-runtime-hooks claude`` in the
+host's hook file for SessionStart, UserPromptSubmit and PreToolUse. The host
+file also sets the timeout (10 seconds is enough).
+"""
 
 import os
 import subprocess
@@ -14,15 +19,18 @@ from agent_runtime.sessions import Registry, own_claude_registration
 app = shared.HookApp(name="agent-runtime")
 
 
-def register(event) -> None:
+def register(
+    event: shared.events.SessionStarted
+    | shared.events.PromptSubmitted
+    | shared.events.ToolCallProposed,
+) -> None:
     context = event.context
     if context.agent_id:
         return
     registry = Registry()
-    provider = context.provider.value
-    if provider == "codex":
+    if context.host == "codex":
         registry.update(
-            provider, context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
+            "codex", context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
         )
         return
     with FileLock(str(registry.store.root / f"bridge-start-{context.session_id}.lock"), timeout=5):
@@ -59,17 +67,17 @@ def register(event) -> None:
         )
 
 
-@app.on(shared.events.SessionStarted, timeout=10)
+@app.on(shared.events.SessionStarted)
 def session_started(event: shared.events.SessionStarted) -> None:
     register(event)
 
 
-@app.on(shared.events.PromptSubmitted, timeout=10)
+@app.on(shared.events.PromptSubmitted)
 def prompt_submitted(event: shared.events.PromptSubmitted) -> None:
     register(event)
 
 
-@app.on(shared.events.ToolCallProposed, timeout=10)
+@app.on(shared.events.ToolCallProposed)
 def tool_call_proposed(event: shared.events.ToolCallProposed) -> None:
     register(event)
 
