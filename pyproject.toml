@@ -26,7 +26,7 @@ Repository = "https://github.com/nimashoghi/agent-runtime"
 
 # Until typed-agent-hooks 0.3.0 is on PyPI. `uv build --no-sources` ignores this table.
 [tool.uv.sources]
-typed-agent-hooks = { git = "https://github.com/nimashoghi/typed-agent-hooks", rev = "314cb0079f9e049591740ec4eee2bc7162a0841b" }
+typed-agent-hooks = { git = "https://github.com/nimashoghi/typed-agent-hooks", rev = "38f4f4a4682f74ca902ab71c68a22d868b1a9d0a" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runtime"]
