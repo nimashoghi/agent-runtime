@@ -85,10 +85,11 @@ def inbox(tmp_path, monkeypatch):
             # no process, and fail after the rest of the cleanup.
             stuck = [m for m in monitors.list(sid) if process_alive(m)]
             for monitor in stuck:
-                worker = psutil.Process(monitor["pid"])
-                for process in [*worker.children(recursive=True), worker]:
-                    with suppress(psutil.NoSuchProcess):
-                        process.kill()
+                with suppress(psutil.NoSuchProcess):
+                    worker = psutil.Process(monitor["pid"])
+                    for process in [*worker.children(recursive=True), worker]:
+                        with suppress(psutil.NoSuchProcess):
+                            process.kill()
             if owner.poll() is None:
                 owner.terminate()
             owner.wait(timeout=5)
@@ -133,7 +134,7 @@ def test_deadline_and_stop_kill_foreground_process_group(inbox, tmp_path):
     monitor = monitors.start(
         f"sleep 30 & echo $! > {pidfile}; wait", description="stop tree", persistent=True
     )
-    wait_for(pidfile.exists)
+    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip())
     child = psutil.Process(int(pidfile.read_text()))
     identity = {"pid": child.pid, "process_created_at": child.create_time()}
     monitors.stop(monitor["monitor_id"])
@@ -212,7 +213,7 @@ def test_worker_stops_its_command_and_exits_on_sigterm(inbox, tmp_path):
     monitor = monitors.start(
         f"echo $$ > {pidfile}; exec sleep 300", description="sigterm", persistent=True
     )
-    wait_for(pidfile.exists)
+    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip())
     command = psutil.Process(int(pidfile.read_text()))
     command_identity = {"pid": command.pid, "process_created_at": command.create_time()}
     worker = wait_for(

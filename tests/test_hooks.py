@@ -126,9 +126,18 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             assert bridge["native_pid"] == owner.pid
             assert process_alive(bridge)
 
-            prompt = {**payload, "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+            prompt = {
+                **payload,
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "hi",
+                "permission_mode": "default",
+            }
             assert app.handle("claude", prompt) is None
             assert registry.get("claude_code", session_id)["bridge"] == bridge
+
+            # A later SessionStart (compact or clear) has no permission mode.
+            assert app.handle("claude", {**payload, "source": "compact"}) is None
+            assert registry.get("claude_code", session_id)["permission_mode"] == "default"
     finally:
         owner.terminate()
         owner.wait(timeout=5)
