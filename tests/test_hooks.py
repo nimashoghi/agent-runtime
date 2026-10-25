@@ -135,7 +135,7 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             assert app.handle("claude", prompt) is None
             assert registry.get("claude_code", session_id)["bridge"] == bridge
 
-            # A later SessionStart (compact or clear) has no permission mode.
+            # SessionStart after compaction has no permission mode.
             assert app.handle("claude", {**payload, "source": "compact"}) is None
             assert registry.get("claude_code", session_id)["permission_mode"] == "default"
     finally:
@@ -150,15 +150,21 @@ def test_permission_mode_belongs_to_the_native_process(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_MESSAGING_SOCKET", str(tmp_path / "inbox.sock"))
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     sleeper = [sys.executable, "-c", "import time; time.sleep(300)"]
-    with subprocess.Popen(sleeper) as first:
+    first = subprocess.Popen(sleeper)
+    try:
         monkeypatch.setenv("CLAUDE_PID", str(first.pid))
         own_claude_registration("s", "/repo", "default", registry=registry)
         # SessionStart after compaction: same process, no mode in the payload.
         own_claude_registration("s", "/repo", None, registry=registry)
         assert registry.get("claude_code", "s")["permission_mode"] == "default"
+    finally:
         first.terminate()
-    with subprocess.Popen(sleeper) as resumed:
+        first.wait(timeout=5)
+    resumed = subprocess.Popen(sleeper)
+    try:
         monkeypatch.setenv("CLAUDE_PID", str(resumed.pid))
         own_claude_registration("s", "/repo", None, registry=registry)
         assert registry.get("claude_code", "s")["permission_mode"] is None
+    finally:
         resumed.terminate()
+        resumed.wait(timeout=5)

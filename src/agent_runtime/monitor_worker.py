@@ -109,7 +109,6 @@ async def run(directory: Path, identity: str) -> None:
                         {"pid": child.pid, "process_created_at": child_created}
                     ):
                         os.killpg(child.pid, signal.SIGKILL)
-                        await exited(child, 5)
                 break
             for reader in readers:
                 if reader.done() and (error := reader.exception()) is not None:
