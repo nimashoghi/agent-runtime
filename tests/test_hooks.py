@@ -75,7 +75,9 @@ def test_subagent_events_do_not_register(tmp_path, monkeypatch, host):
 def test_hooks_do_not_import_the_claude_sdk():
     # Hook environments install agent-runtime-py without the `claude` extra.
     code = "import sys, agent_runtime.hooks; print('claude_agent_sdk' in sys.modules)"
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
     assert result.stdout == "False\n"
 
 
