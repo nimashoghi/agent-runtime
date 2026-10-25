@@ -39,7 +39,7 @@ requires-dist = [
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
     { name = "psutil", specifier = ">=7,<8" },
-    { name = "typed-agent-hooks", git = "https://github.com/nimashoghi/typed-agent-hooks?rev=16d653707d25d012a639bccf8e5b8df47a1d4a0e" },
+    { name = "typed-agent-hooks", git = "https://github.com/nimashoghi/typed-agent-hooks?rev=753b41eaf3465243e92161852df7243a7d0224ee" },
 ]
 provides-extras = ["claude"]
 
@@ -951,7 +951,7 @@ wheels = [
 [[package]]
 name = "typed-agent-hooks"
 version = "0.3.0"
-source = { git = "https://github.com/nimashoghi/typed-agent-hooks?rev=16d653707d25d012a639bccf8e5b8df47a1d4a0e#16d653707d25d012a639bccf8e5b8df47a1d4a0e" }
+source = { git = "https://github.com/nimashoghi/typed-agent-hooks?rev=753b41eaf3465243e92161852df7243a7d0224ee#753b41eaf3465243e92161852df7243a7d0224ee" }
 dependencies = [
     { name = "pydantic" },
 ]
