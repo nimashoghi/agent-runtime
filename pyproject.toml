@@ -24,10 +24,6 @@ claude = ["claude-agent-sdk==0.2.159"]
 [project.urls]
 Repository = "https://github.com/nimashoghi/agent-runtime"
 
-# Delete after typed-agent-hooks 0.3.0 is on PyPI, then run `uv lock`.
-[tool.uv.sources]
-typed-agent-hooks = { git = "https://github.com/nimashoghi/typed-agent-hooks", rev = "753b41eaf3465243e92161852df7243a7d0224ee" }
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runtime"]
 
