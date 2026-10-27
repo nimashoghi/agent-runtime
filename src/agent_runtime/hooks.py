@@ -14,15 +14,18 @@ from agent_runtime.sessions import Registry, own_claude_registration
 app = shared.HookApp(name="agent-runtime")
 
 
-def register(event) -> None:
+def register(
+    event: shared.events.SessionStarted
+    | shared.events.PromptSubmitted
+    | shared.events.ToolCallProposed,
+) -> None:
     context = event.context
     if context.agent_id:
         return
     registry = Registry()
-    provider = context.provider.value
-    if provider == "codex":
+    if context.host == "codex":
         registry.update(
-            provider, context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
+            "codex", context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
         )
         return
     with FileLock(str(registry.store.root / f"bridge-start-{context.session_id}.lock"), timeout=5):
@@ -59,24 +62,6 @@ def register(event) -> None:
         )
 
 
-@app.on(shared.events.SessionStarted, timeout=10)
-def session_started(event: shared.events.SessionStarted) -> None:
-    register(event)
-
-
-@app.on(shared.events.PromptSubmitted, timeout=10)
-def prompt_submitted(event: shared.events.PromptSubmitted) -> None:
-    register(event)
-
-
-@app.on(shared.events.ToolCallProposed, timeout=10)
-def tool_call_proposed(event: shared.events.ToolCallProposed) -> None:
-    register(event)
-
-
-def main() -> None:
-    app.main()
-
-
-if __name__ == "__main__":
-    main()
+app.on(shared.events.SessionStarted)(register)
+app.on(shared.events.PromptSubmitted)(register)
+app.on(shared.events.ToolCallProposed)(register)
