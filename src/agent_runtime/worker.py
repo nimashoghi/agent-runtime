@@ -102,6 +102,15 @@ class Worker:
                     self.emit("input.delivered", message_id=admitted, native_uuid=message.uuid)
                     if self.active and self.active["id"] == admitted:
                         self.active["acknowledged"] = True
+                elif (
+                    (message.origin or {}).get("kind", "human") != "human"
+                    and message.parent_tool_use_id is None
+                    and not self.presentation_started
+                ):
+                    # A message from another origin (a peer session, a background task)
+                    # starts a turn that no input of this runtime asked for.
+                    self.emit("turn.started", origin="native")
+                    self.presentation_started = True
             elif isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
                 if not self.presentation_started:
                     self.emit("turn.started", origin="native")
@@ -253,6 +262,8 @@ class Worker:
                 if (
                     timeout
                     and self.active is None
+                    # A turn that native Claude runs for another origin is work too.
+                    and not self.presentation_started
                     and not self.background_tasks
                     and time.monotonic() - self.last_activity >= timeout
                     and not any(

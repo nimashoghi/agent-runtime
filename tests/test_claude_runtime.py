@@ -51,6 +51,15 @@ for line in sys.stdin:
             result("answer to both", PEER)
             continue
         emit({"type":"user","uuid":message["uuid"],"message":{"role":"user","content":text},"origin":{"kind":"human"}})
+        if text == "then-a-peer-turn":
+            # The input's own turn ends; a peer message then starts a turn that works
+            # in silence for longer than the idle timeout.
+            import time
+            result("echo: " + text)
+            emit({"type":"user","uuid":"peer-message","message":{"role":"user","content":"peer"},"origin":PEER})
+            time.sleep(1.5)
+            result("peer turn done", PEER)
+            continue
         if text == "permission":
             pending = text
             emit({"type":"control_request","request_id":"permission-1",
@@ -198,5 +207,39 @@ async def test_input_folded_into_a_peer_turn_settles_with_that_turn(tmp_path, na
         await runtime.submit(sid, "next", message_id="m2", options=opts, resume=False)
         await wait_for(lambda: len(settled()) >= 3)
         assert settled()[2]["message_ids"] == ["m2"]
+    finally:
+        await runtime.stop(eid)
+
+
+async def test_a_turn_for_another_origin_is_not_ended_by_the_idle_timeout(tmp_path, native):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = LaunchOptions(
+        cwd=tmp_path,
+        claude=native,
+        idle_timeout_seconds=0.5,
+        environment={"FAKE_CLAUDE_LOG": str(tmp_path / "inputs.jsonl")},
+    )
+    value = await runtime.start("then-a-peer-turn", message_id="m1", options=opts, launch_id="peer")
+    sid, eid = value["session_id"], value["execution_id"]
+    try:
+        await wait_for(lambda: runtime.inspect(eid)["result"])
+        events = [e["event"] for e in runtime.store.events(sid)]
+        kinds = [
+            e["type"]
+            for e in events
+            if e["type"] in {"turn.started", "work.settled", "worker.exited"}
+        ]
+        # The worker saw the peer turn start and waited for its result before its idle exit.
+        assert kinds == [
+            "turn.started",
+            "work.settled",
+            "turn.started",
+            "work.settled",
+            "worker.exited",
+        ]
+        assert events[-1]["reason"] == "idle_timeout"
+        settled = [e for e in events if e["type"] == "work.settled"]
+        assert [e["message_ids"] for e in settled] == [["m1"], []]
+        assert settled[1]["message"] == "peer turn done"
     finally:
         await runtime.stop(eid)

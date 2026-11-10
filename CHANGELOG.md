@@ -3,6 +3,7 @@
 ## 0.2.1
 
 - Fix: a Claude input that native Claude folded into a turn started by something else (a peer message, a background task) never settled, because that turn's result carries the other origin. The worker then took no further input and never exited on idle. A result now settles the active input when the input's echo arrived before it.
+- Fix: a turn that native Claude runs for another origin (a peer message) counts as work: the worker reports `turn.started` when that message arrives, not at the first assistant text, and does not exit on idle while the turn runs.
 - Fix: the Claude worker starts with `-P`, so the session's working folder is not on its import path.
 
 ## 0.2.0
