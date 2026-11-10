@@ -100,6 +100,8 @@ class Worker:
             if isinstance(message, UserMessage) and message.uuid:
                 if admitted := self.store.admit(self.execution_id, message.uuid):
                     self.emit("input.delivered", message_id=admitted, native_uuid=message.uuid)
+                    if self.active and self.active["id"] == admitted:
+                        self.active["acknowledged"] = True
             elif isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
                 if not self.presentation_started:
                     self.emit("turn.started", origin="native")
@@ -113,7 +115,15 @@ class Worker:
                 if message.session_id != self.session_id:
                     raise RuntimeError("native Claude returned a different session ID")
                 human = message.origin is None or message.origin.get("kind") == "human"
-                active = self.active if human else None
+                # Native Claude can fold an input into a turn that something else started
+                # (a peer message, a background task); that turn's result carries the other
+                # origin. The turn that follows the input's echo is the one that consumed it.
+                # A non-human result before the echo belongs to an earlier turn.
+                active = (
+                    self.active
+                    if self.active and (human or self.active.get("acknowledged"))
+                    else None
+                )
                 status = "failed" if message.is_error else "completed"
                 if message.terminal_reason in {"aborted_streaming", "aborted_tools"}:
                     status = "interrupted"
