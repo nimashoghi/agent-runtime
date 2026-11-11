@@ -3,8 +3,9 @@
 ## 0.2.2
 
 - Add `LaunchOptions.effort` (`low`, `medium`, `high`, `xhigh` or `max`), passed to native Claude.
-- A worker whose native Claude fails reports the last lines that Claude wrote to stderr in its result. Before, the error only said to check stderr.
-- Fix: `LaunchOptions.claude` and the `claude` found on PATH are used as given, not as their link target. A version manager's shim (a link to the manager) was resolved to the manager, which then did not run Claude.
+- A worker that fails adds `native_stderr` to its result: the last lines (at most 20, each at most 500 characters) that native Claude wrote to stderr since its last result. They are often the reason of a failed start, where the SDK's error only says to check stderr. They are not redacted; a consumer decides whether to show them.
+- Fix: `LaunchOptions.claude` and the `claude` found on PATH are used as given (made absolute), not as their link target. A version manager's shim (a link to the manager) was resolved to the manager, which then did not run Claude. A path that is not a file, also a directory, now raises `ValueError`; a missing path raised `FileNotFoundError` before.
+- A repeated launch ID no longer compares the path of the Claude executable, so a launch that 0.2.1 recorded can be repeated.
 
 ## 0.2.1
 

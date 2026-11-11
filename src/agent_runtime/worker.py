@@ -46,13 +46,14 @@ class Worker:
         self.last_activity = time.monotonic()
         self.background_tasks: set[str] = set()
         self.presentation_started = False
-        # The last lines that native Claude wrote to stderr: its reason when it fails.
+        # The last lines that native Claude wrote to stderr since its last result. When the
+        # worker fails, they go into its result apart from the error: they are often the
+        # reason (the SDK's error only says to check stderr), but not always.
         self.stderr: collections.deque[str] = collections.deque(maxlen=20)
 
     def native_stderr(self, line: str) -> None:
         log.debug("claude: %s", line)
-        if line.strip():
-            self.stderr.append(line.rstrip())
+        self.stderr.append(line[:500])
 
     def emit(self, kind: str, **fields: Any) -> None:
         self.store.append(self.execution_id, self.session_id, {"type": kind, **fields})
@@ -131,6 +132,7 @@ class Worker:
             elif isinstance(message, ResultMessage):
                 if message.session_id != self.session_id:
                     raise RuntimeError("native Claude returned a different session ID")
+                self.stderr.clear()  # what it wrote before a result is not about a later failure
                 human = message.origin is None or message.origin.get("kind") == "human"
                 # Native Claude can fold an input into a turn that something else started
                 # (a peer message, a background task); that turn's result carries the other
@@ -285,10 +287,9 @@ class Worker:
                 await asyncio.sleep(0.1)
         except Exception as error:
             log.exception("Claude worker failed")
-            # The SDK's error only points at stderr; the reason is in what Claude wrote there.
-            reason = "\n".join(self.stderr)[-2000:]
-            failure = f"{error}\nClaude wrote: {reason}" if reason else str(error)
-            result = {"status": "failed", "error": failure}
+            result = {"status": "failed", "error": str(error)}
+            if self.stderr:
+                result["native_stderr"] = list(self.stderr)
         finally:
             self.stopping.set()
             try:
