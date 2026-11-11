@@ -1,6 +1,7 @@
 """Exercise the real SDK and detached processes against a deterministic native boundary."""
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -543,4 +544,56 @@ async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_w
         assert old["result"]["error"] == "worker exited without a terminal record"
         assert runtime.store.receipt(sid, "m2")["status"] == "rejected"
     finally:
+        # Still there if an assertion failed; gone, or a zombie, otherwise.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(first["pid"], 9)
         await runtime.stop(resumed["execution_id"])
+
+
+async def test_a_worker_that_cannot_be_inspected_is_not_recorded_as_gone(
+    tmp_path, native, monkeypatch
+):
+    """Only proof ends a worker's record: an inspection that fails proves nothing."""
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    value = await runtime.start(
+        "hold", message_id="m1", options=options(tmp_path, native), launch_id="denied"
+    )
+    sid, eid = value["session_id"], value["execution_id"]
+
+    def denied(self, *arguments):
+        raise psutil.AccessDenied(self.pid)
+
+    def crashed(self, *arguments):
+        raise SystemError("<built-in function proc_cmdline> returned a result with an exception")
+
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+        recorded = runtime.store.execution(eid)
+        for unreadable in (denied, crashed):
+            with monkeypatch.context() as patch:
+                # The command line cannot be read, and neither can the start time.
+                patch.setattr(psutil.Process, "cmdline", unreadable)
+                patch.setattr(psutil.Process, "create_time", unreadable)
+                assert claude_module.worker_alive(recorded)
+                assert runtime.inspect(eid)["result"] is None
+            with monkeypatch.context() as patch:
+                # Nothing can be read at all.
+                patch.setattr(psutil.Process, "status", unreadable)
+                patch.setattr(psutil.Process, "create_time", unreadable)
+                assert runtime.inspect(eid)["result"] is None
+        with monkeypatch.context() as patch:
+            # The command line cannot be read and the start time differs: on Linux that is
+            # a step of the clock, elsewhere it is another process with the worker's PID.
+            patch.setattr(psutil.Process, "cmdline", denied)
+            patch.setattr(psutil.Process, "create_time", lambda self: 1.0)
+            patch.setattr(claude_module.sys, "platform", "linux")
+            assert claude_module.worker_alive(recorded)
+            patch.setattr(claude_module.sys, "platform", "darwin")
+            assert not claude_module.worker_alive(recorded)
+            # An empty command line (a process in the middle of its start) is no proof.
+            patch.setattr(psutil.Process, "cmdline", lambda self: [])
+            patch.setattr(psutil.Process, "create_time", denied)
+            assert claude_module.worker_alive(recorded)
+        assert runtime.store.receipt(sid, "m1")["status"] == "delivered"
+    finally:
+        await runtime.stop(eid)

@@ -345,8 +345,8 @@ def main() -> None:
         # killed is free. No other worker waits for the lease either: `submit` makes a
         # new execution only when the newest one is closed, and an execution that waits
         # is closed only together with its result. So an execution without a result is
-        # of a worker that was killed after it closed its execution. Nothing else looks
-        # at an execution that is not the session's newest.
+        # of a worker that was killed after it closed its execution. A resume does not
+        # look at an execution that is not the session's newest.
         for other in store.executions(value["session_id"]):
             if other["execution_id"] != identity and other.get("result") is None:
                 store.finish(

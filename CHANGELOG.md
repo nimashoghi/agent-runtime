@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- Fix: a worker process that cannot be inspected counts as running. In 0.2.3, when the command line could not be read and the fallback to the start time also failed (psutil raised an error other than "no such process"), or the start time differed on Linux (a step of the system clock), the worker was taken for gone, and `inspect` recorded a live worker as failed. Only proof ends a worker's record now: no such process, a zombie, a command line of another process, or (not on Linux) another start time.
+
 ## 0.2.3
 
 - `Store.snapshot(session_id, after=0)` reads a session's executions (in the order of their creation), its events after a cursor, and the receipts of all its inputs in one transaction. `Store.executions(session_id)` lists the executions alone.

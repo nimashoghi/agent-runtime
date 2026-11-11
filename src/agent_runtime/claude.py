@@ -98,12 +98,21 @@ def worker_alive(value: dict[str, Any]) -> bool:
 
     The worker is known by its command line, which names the execution. A reused PID cannot
     carry it, and it does not depend on the clock: a start time does (psutil on Linux
-    computes it from the boot time, which a step of the system clock moves), and a live
-    worker must never be recorded as gone."""
+    computes it from the boot time, which a step of the system clock moves).
+
+    Only proof makes the answer false: no such process, a zombie, or a process that is
+    shown to be another one. A process that cannot be inspected counts as running. A
+    caller records a worker as gone on a false answer, and that record must never be made
+    for a live worker."""
     if not value.get("pid"):
         return False
     try:
         process = psutil.Process(value["pid"])
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError, SystemError):
+        return True  # not known
+    try:
         if process.status() == psutil.STATUS_ZOMBIE:
             return False
         command = process.cmdline()
@@ -111,13 +120,27 @@ def worker_alive(value: dict[str, Any]) -> bool:
         return False
     except (psutil.Error, OSError, SystemError):
         # The command line cannot be read: on macOS, a process that is ending or one of
-        # another user (psutil raises AccessDenied or SystemError). There the start time
-        # comes from the kernel's record of the process and does not move.
-        return process_alive(value)
+        # another user (psutil raises AccessDenied or SystemError).
+        return _started_as_recorded(process, value)
     if not command:
-        # No arguments yet (Linux, a process in the middle of its start): not known.
-        return process_alive(value)
+        # No arguments yet (Linux, a process in the middle of its start).
+        return _started_as_recorded(process, value)
     return "agent_runtime.worker" in command and value["execution_id"] in command
+
+
+def _started_as_recorded(process: psutil.Process, value: dict[str, Any]) -> bool:
+    """For a process whose command line says nothing: false only when its start time proves
+    that it is not the recorded process."""
+    try:
+        started = process.create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError, SystemError):
+        return True  # not known
+    if sys.platform == "linux" or not value.get("process_created_at"):
+        # On Linux a start time moves with the system clock, so a difference is no proof.
+        return True
+    return abs(started - value["process_created_at"]) < 0.01
 
 
 class ClaudeRuntime:
