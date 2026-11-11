@@ -2,7 +2,7 @@
 
 ## 0.2.3
 
-- `Store.snapshot(session_id, after=0)` reads a session's executions (in the order of their creation), its events after a cursor, and the receipts of all its inputs in one transaction.
+- `Store.snapshot(session_id, after=0)` reads a session's executions (in the order of their creation), its events after a cursor, and the receipts of all its inputs in one transaction. `Store.executions(session_id)` lists the executions alone.
 - Fix: a worker that ends records its result and the receipts of its open inputs in one transaction (`Store.finish`), and a turn's settlement and the `uncertain` receipt of an input whose echo was lost likewise (`Store.settle`). Before, a reader could see a `rejected` or `uncertain` receipt without the result or the settlement that explains it. `Store.lose_dispatches` and `Store.reject_pending` are removed.
 - Fix: `ClaudeRuntime.inspect` no longer replaces a result that the worker recorded itself in the moment before its process ended.
 - Fix: a worker that exits (on idle, on a stop, after a failure) first closes its execution to new inputs (`Store.close_to_inputs`, state `stopping`), and an idle worker does not close while an accepted input waits. `submit` could give an input to a worker that was exiting on idle, which then rejected it; with `resume=True` it now starts a new execution. An input that is accepted in the moment before another exit is still rejected, together with the worker's result. `Store.accept` returns `None` for a closed execution and raises `KeyError` for an unknown one.

@@ -122,4 +122,6 @@ def test_the_newest_execution_is_the_one_created_last_whatever_the_clock_says(tm
     latest = store.latest("s")
     assert latest is not None and latest["execution_id"] == "resumed"
     assert [e["execution_id"] for e in store.snapshot("s")["executions"]] == ["first", "resumed"]
+    assert store.executions("s") == store.snapshot("s")["executions"]
+    assert store.executions("other") == []
     assert store.snapshot("other") == {"executions": [], "events": [], "receipts": {}}

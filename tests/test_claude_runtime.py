@@ -520,9 +520,10 @@ def _only_execution(runtime: ClaudeRuntime) -> str:
 async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_worker(
     tmp_path, native
 ):
-    """A worker closed its execution and was then killed, so it left no record of its exit.
-    A resume makes a newer execution, and nothing inspects the older one by itself: the
-    worker that gets the lease records it."""
+    """A worker closed its execution and is still alive when the session is resumed, so
+    `submit` cannot record its exit. It is then killed and leaves no record of its own.
+    Nothing inspects an execution that is not the newest: the worker that gets the lease
+    records it."""
     runtime = ClaudeRuntime(tmp_path / "runtime")
     opts = options(tmp_path, native)
     first = await runtime.start("hold", message_id="m1", options=opts, launch_id="killed")
@@ -530,12 +531,13 @@ async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_w
     await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
     runtime.store.accept(sid, eid, "m2", "never taken")
     runtime.store.close_to_inputs(eid)
-    os.killpg(runtime.store.execution(eid)["pid"], 9)
-    await wait_for(lambda: not claude_module.worker_alive(runtime.store.execution(eid)))
-    assert runtime.store.execution(eid)["result"] is None
     resumed = await runtime.submit(sid, "later", message_id="m3", options=opts, resume=True)
     try:
         assert resumed["execution_id"] != eid
+        await asyncio.sleep(1)  # the new worker waits for the lease of the old one
+        assert runtime.store.execution(eid)["result"] is None
+        assert runtime.store.execution(resumed["execution_id"])["state"] == "starting"
+        os.killpg(runtime.store.execution(eid)["pid"], 9)
         await wait_for(lambda: runtime.store.receipt(sid, "m3")["status"] == "delivered")
         old = runtime.store.execution(eid)
         assert old["result"]["error"] == "worker exited without a terminal record"

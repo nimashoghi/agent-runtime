@@ -308,7 +308,7 @@ class ClaudeRuntime:
         value = self.inspect(execution_id)
         # Every worker of the session, not only this execution's: an earlier one can still
         # end (state `stopping`) after a later one has its result.
-        for other in self.store.snapshot(value["session_id"])["executions"]:
+        for other in self.store.executions(value["session_id"]):
             if self.inspect(other["execution_id"]).get("result") is None:
                 raise ValueError(
                     "stop the managed worker before opening this session in interactive Claude"

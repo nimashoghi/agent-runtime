@@ -340,10 +340,14 @@ def main() -> None:
         store.append(identity, value["session_id"], {"type": "worker.exited", **result})
         raise SystemExit(1) from None
     try:
-        # This worker holds the lease, so every other worker of the session is gone. One
-        # that was killed after it closed its execution left no record; nothing else
-        # looks at an execution that is not the session's newest.
-        for other in store.snapshot(value["session_id"])["executions"]:
+        # This worker holds the lease, so no other worker of the session runs: a worker
+        # records its exit before it releases the lease, and the lease of one that was
+        # killed is free. No other worker waits for the lease either: `submit` makes a
+        # new execution only when the newest one is closed, and an execution that waits
+        # is closed only together with its result. So an execution without a result is
+        # of a worker that was killed after it closed its execution. Nothing else looks
+        # at an execution that is not the session's newest.
+        for other in store.executions(value["session_id"]):
             if other["execution_id"] != identity and other.get("result") is None:
                 store.finish(
                     other["execution_id"],

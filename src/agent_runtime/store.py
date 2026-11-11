@@ -93,6 +93,14 @@ class Store:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def executions(self, session_id: str) -> list[dict[str, Any]]:
+        """The session's executions in the order of their creation in this store."""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT value FROM executions WHERE session_id=? ORDER BY rowid", (session_id,)
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def update(self, identity: str, **fields: Any) -> dict[str, Any]:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
