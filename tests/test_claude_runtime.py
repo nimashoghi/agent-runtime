@@ -24,10 +24,11 @@ if "--version" in sys.argv:
 def emit(value):
     print(json.dumps(value), flush=True)
 session = next(a.split("=", 1)[1] for a in sys.argv if a.startswith(("--session-id=", "--resume=")))
-def result(text):
+PEER = {"kind":"peer","from":"unknown"}
+def result(text, origin={"kind":"human"}):
     emit({"type":"result", "subtype":"success", "is_error":False,
           "duration_ms":1,"duration_api_ms":1,"num_turns":1,"session_id":session,
-          "result":text,"origin":{"kind":"human"},"usage":{}})
+          "result":text,"origin":origin,"usage":{}})
 pending = None
 for line in sys.stdin:
     message = json.loads(line)
@@ -40,7 +41,25 @@ for line in sys.stdin:
             log.write(json.dumps({"text": text, "uuid":message["uuid"], "session": session}) + "\n")
         if text == "crash-before-echo":
             raise SystemExit(23)
+        if text == "folded-into-peer-turn":
+            # Native Claude, observed 2026-11-10: a peer message's turn ends, a second peer
+            # message starts a turn, the queued human input joins that turn, and the turn's
+            # result carries the peer origin.
+            result("first peer turn", PEER)
+            emit({"type":"user","uuid":"peer-message","message":{"role":"user","content":"peer"},"origin":PEER})
+            emit({"type":"user","uuid":message["uuid"],"message":{"role":"user","content":text},"origin":{"kind":"human"}})
+            result("answer to both", PEER)
+            continue
         emit({"type":"user","uuid":message["uuid"],"message":{"role":"user","content":text},"origin":{"kind":"human"}})
+        if text == "then-a-peer-turn":
+            # The input's own turn ends; a peer message then starts a turn that works
+            # in silence for longer than the idle timeout.
+            import time
+            result("echo: " + text)
+            emit({"type":"user","uuid":"peer-message","message":{"role":"user","content":"peer"},"origin":PEER})
+            time.sleep(1.5)
+            result("peer turn done", PEER)
+            continue
         if text == "permission":
             pending = text
             emit({"type":"control_request","request_id":"permission-1",
@@ -162,5 +181,65 @@ async def test_permission_waits_for_durable_explicit_answer(tmp_path, native):
         assert json.loads(settled[0]["message"])["behavior"] == "deny"
         with pytest.raises(ValueError):
             runtime.store.answer(eid, requests[0]["id"], {"decision": "allow"})
+    finally:
+        await runtime.stop(eid)
+
+
+async def test_input_folded_into_a_peer_turn_settles_with_that_turn(tmp_path, native):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = options(tmp_path, native)
+    value = await runtime.start(
+        "folded-into-peer-turn", message_id="m1", options=opts, launch_id="folded"
+    )
+    sid, eid = value["session_id"], value["execution_id"]
+
+    def settled():
+        return [
+            e["event"] for e in runtime.store.events(sid) if e["event"]["type"] == "work.settled"
+        ]
+
+    try:
+        await wait_for(lambda: len(settled()) >= 2)
+        # The first result came before the input's echo, so it is not the input's result.
+        assert [event["message_ids"] for event in settled()] == [[], ["m1"]]
+        assert settled()[1]["message"] == "answer to both"
+        # The worker is free again: it takes the next input.
+        await runtime.submit(sid, "next", message_id="m2", options=opts, resume=False)
+        await wait_for(lambda: len(settled()) >= 3)
+        assert settled()[2]["message_ids"] == ["m2"]
+    finally:
+        await runtime.stop(eid)
+
+
+async def test_a_turn_for_another_origin_is_not_ended_by_the_idle_timeout(tmp_path, native):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = LaunchOptions(
+        cwd=tmp_path,
+        claude=native,
+        idle_timeout_seconds=0.5,
+        environment={"FAKE_CLAUDE_LOG": str(tmp_path / "inputs.jsonl")},
+    )
+    value = await runtime.start("then-a-peer-turn", message_id="m1", options=opts, launch_id="peer")
+    sid, eid = value["session_id"], value["execution_id"]
+    try:
+        await wait_for(lambda: runtime.inspect(eid)["result"])
+        events = [e["event"] for e in runtime.store.events(sid)]
+        kinds = [
+            e["type"]
+            for e in events
+            if e["type"] in {"turn.started", "work.settled", "worker.exited"}
+        ]
+        # The worker saw the peer turn start and waited for its result before its idle exit.
+        assert kinds == [
+            "turn.started",
+            "work.settled",
+            "turn.started",
+            "work.settled",
+            "worker.exited",
+        ]
+        assert events[-1]["reason"] == "idle_timeout"
+        settled = [e for e in events if e["type"] == "work.settled"]
+        assert [e["message_ids"] for e in settled] == [["m1"], []]
+        assert settled[1]["message"] == "peer turn done"
     finally:
         await runtime.stop(eid)

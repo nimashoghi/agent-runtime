@@ -177,6 +177,9 @@ class ClaudeRuntime:
                     child = subprocess.Popen(
                         [
                             sys.executable,
+                            # The worker's cwd is the session's folder, which the agent
+                            # writes; it must not be on the worker's import path.
+                            "-P",
                             "-m",
                             "agent_runtime.worker",
                             str(self.store.root),
