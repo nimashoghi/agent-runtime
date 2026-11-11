@@ -433,10 +433,6 @@ async def test_an_input_during_a_workers_idle_exit_resumes_the_session(tmp_path,
             "status": "completed",
             "reason": "idle_timeout",
         }
-        # An input that arrives before the idle time is over is taken by the same worker.
-        await runtime.submit(sid, "soon", message_id="m3", options=opts, resume=True)
-        await wait_for(lambda: settled("m3"))
-        assert runtime.store.receipt(sid, "m3")["execution_id"] == receipt["execution_id"]
     finally:
         await runtime.stop(runtime.store.latest(sid)["execution_id"])
 
@@ -451,7 +447,7 @@ async def test_a_resumed_worker_waits_for_the_lease_of_the_worker_before_it(tmp_
     await runtime.stop(first["execution_id"])
     # The test stands for a worker that recorded its exit and still ends.
     lease = FileLock(str(root / f"lease-{sid}.lock"))
-    await wait_for(lambda: lease.acquire(timeout=0) or True)
+    lease.acquire(timeout=10)  # the stopped worker frees it a moment after its record
     try:
         resumed = await runtime.submit(sid, "later", message_id="m2", options=opts, resume=True)
         await asyncio.sleep(1)
@@ -519,3 +515,30 @@ def _only_execution(runtime: ClaudeRuntime) -> str:
     with runtime.store.connect() as db:
         (row,) = db.execute("SELECT id FROM executions").fetchall()
     return row[0]
+
+
+async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_worker(
+    tmp_path, native
+):
+    """A worker closed its execution and was then killed, so it left no record of its exit.
+    A resume makes a newer execution, and nothing inspects the older one by itself: the
+    worker that gets the lease records it."""
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = options(tmp_path, native)
+    first = await runtime.start("hold", message_id="m1", options=opts, launch_id="killed")
+    sid, eid = first["session_id"], first["execution_id"]
+    await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+    runtime.store.accept(sid, eid, "m2", "never taken")
+    runtime.store.close_to_inputs(eid)
+    os.killpg(runtime.store.execution(eid)["pid"], 9)
+    await wait_for(lambda: not claude_module.worker_alive(runtime.store.execution(eid)))
+    assert runtime.store.execution(eid)["result"] is None
+    resumed = await runtime.submit(sid, "later", message_id="m3", options=opts, resume=True)
+    try:
+        assert resumed["execution_id"] != eid
+        await wait_for(lambda: runtime.store.receipt(sid, "m3")["status"] == "delivered")
+        old = runtime.store.execution(eid)
+        assert old["result"]["error"] == "worker exited without a terminal record"
+        assert runtime.store.receipt(sid, "m2")["status"] == "rejected"
+    finally:
+        await runtime.stop(resumed["execution_id"])

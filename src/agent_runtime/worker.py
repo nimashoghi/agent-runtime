@@ -285,7 +285,7 @@ class Worker:
                     )
                     # An input can arrive at this moment. The execution closes to new inputs
                     # only if none waits; one that waits is taken in the next pass.
-                    and self.store.close(self.execution_id, unless_input_waits=True)
+                    and self.store.close_to_inputs(self.execution_id, unless_input_waits=True)
                 ):
                     result = {"status": "completed", "reason": "idle_timeout"}
                     break
@@ -297,8 +297,11 @@ class Worker:
                 result["native_stderr"] = list(self.stderr)
         finally:
             self.stopping.set()
-            # From here on a new input goes to a resumed execution, not to this worker.
-            self.store.close(self.execution_id)
+            try:
+                # From here on a new input goes to a resumed execution, not to this worker.
+                self.store.close_to_inputs(self.execution_id)
+            except Exception:
+                log.exception("closing the execution to new inputs failed")
             try:
                 await client.disconnect()
             except Exception:
@@ -329,18 +332,25 @@ def main() -> None:
     try:
         lease.acquire(timeout=LEASE_WAIT_SECONDS)
     except Timeout:
-        store.finish(
-            identity,
-            {
-                "status": "failed",
-                "error": "another worker of this session did not exit within"
-                f" {LEASE_WAIT_SECONDS:g} s",
-            },
-            rejection="worker could not start",
-            exited_at=time.time(),
-        )
+        result = {
+            "status": "failed",
+            "error": f"another worker of this session did not exit within {LEASE_WAIT_SECONDS:g} s",
+        }
+        store.finish(identity, result, rejection="worker could not start", exited_at=time.time())
+        store.append(identity, value["session_id"], {"type": "worker.exited", **result})
         raise SystemExit(1) from None
     try:
+        # This worker holds the lease, so every other worker of the session is gone. One
+        # that was killed after it closed its execution left no record; nothing else
+        # looks at an execution that is not the session's newest.
+        for other in store.snapshot(value["session_id"])["executions"]:
+            if other["execution_id"] != identity and other.get("result") is None:
+                store.finish(
+                    other["execution_id"],
+                    {"status": "failed", "error": "worker exited without a terminal record"},
+                    rejection="worker exited before dispatch",
+                    observed=True,
+                )
         process = psutil.Process()
         store.update(identity, pid=process.pid, process_created_at=process.create_time())
         asyncio.run(Worker(store, identity).run())

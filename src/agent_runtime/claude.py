@@ -114,6 +114,9 @@ def worker_alive(value: dict[str, Any]) -> bool:
         # another user (psutil raises AccessDenied or SystemError). There the start time
         # comes from the kernel's record of the process and does not move.
         return process_alive(value)
+    if not command:
+        # No arguments yet (Linux, a process in the middle of its start): not known.
+        return process_alive(value)
     return "agent_runtime.worker" in command and value["execution_id"] in command
 
 
@@ -256,10 +259,9 @@ class ClaudeRuntime:
         self, session_id: str, text: str, *, message_id: str, options: LaunchOptions, resume: bool
     ) -> dict[str, Any]:
         # Submissions of one session are serialized. A worker closes its execution to new
-        # inputs before it exits (`Store.close`), and `Store.accept` refuses a closed one in
-        # the same transaction, so an input is never given to a worker that is on its way
-        # out: it goes to a resumed execution, whose worker waits for the session's lease
-        # until the old worker is gone.
+        # inputs before it exits (`Store.close_to_inputs`), and `Store.accept` refuses a
+        # closed one in the same transaction. The input then goes to a resumed execution,
+        # whose worker waits for the session's lease until the old worker is gone.
         with FileLock(str(self.store.root / f"submit-{session_id}.lock")):
             if saved := self.store.receipt(session_id, message_id):
                 self.inspect(saved["execution_id"])
@@ -304,8 +306,11 @@ class ClaudeRuntime:
 
     def attach(self, execution_id: str) -> list[str]:
         value = self.inspect(execution_id)
-        if value.get("result") is None:
-            raise ValueError(
-                "stop the managed worker before opening this session in interactive Claude"
-            )
+        # Every worker of the session, not only this execution's: an earlier one can still
+        # end (state `stopping`) after a later one has its result.
+        for other in self.store.snapshot(value["session_id"])["executions"]:
+            if self.inspect(other["execution_id"]).get("result") is None:
+                raise ValueError(
+                    "stop the managed worker before opening this session in interactive Claude"
+                )
         return [value["configuration"]["claude"], "--resume", value["session_id"]]

@@ -65,7 +65,9 @@ def test_a_snapshot_never_has_a_doubtful_receipt_without_what_explains_it(tmp_pa
         writer = threading.Thread(target=write)
         writer.start()
         go.set()
+        deadline = time.monotonic() + 30
         while True:
+            assert time.monotonic() < deadline, "the writer did not write"
             view = store.snapshot("s")
             receipt = view["receipts"][message]
             if receipt["status"] in {"rejected", "uncertain"}:
@@ -99,16 +101,16 @@ def test_a_closed_execution_takes_no_input_and_an_idle_close_leaves_no_input(tmp
     execution(store, "e1")
     store.accept("s", "e1", "m1", "do it")
     # An input waits: the idle worker must not close; it takes the input instead.
-    assert store.close("e1", unless_input_waits=True) is False
+    assert store.close_to_inputs("e1", unless_input_waits=True) is False
     assert store.execution("e1")["state"] == "running"
     assert store.take_input("e1") is not None
-    assert store.close("e1", unless_input_waits=True) is True
+    assert store.close_to_inputs("e1", unless_input_waits=True) is True
     assert store.execution("e1")["state"] == "stopping"
     # Closed: a new input is refused and not journaled; a known message ID keeps its receipt.
     assert store.accept("s", "e1", "m2", "more") is None
     assert store.receipt("s", "m2") is None
     assert store.accept("s", "e1", "m1", "do it")["message_id"] == "m1"
-    assert store.close("e1") is True  # again: no change
+    assert store.close_to_inputs("e1") is True  # again: no change
     store.finish("e1", {"status": "completed"}, rejection="x")
     assert store.accept("s", "e1", "m3", "more") is None
 

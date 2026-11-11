@@ -103,7 +103,7 @@ class Store:
             db.execute("UPDATE executions SET value=? WHERE id=?", (json.dumps(value), identity))
         return value
 
-    def close(self, identity: str, *, unless_input_waits: bool = False) -> bool:
+    def close_to_inputs(self, identity: str, *, unless_input_waits: bool = False) -> bool:
         """Close an execution to new inputs: `accept` refuses it from now on. Return whether
         it is closed.
 
