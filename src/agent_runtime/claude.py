@@ -33,6 +33,7 @@ class LaunchOptions:
     permission_mode: str = "default"
     allowed_tools: tuple[str, ...] = ()
     model: str | None = None
+    effort: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def configuration(self) -> dict[str, Any]:
@@ -48,15 +49,22 @@ class LaunchOptions:
             "auto",
         }:
             raise ValueError("unknown Claude permission mode")
+        if self.effort not in {None, "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("unknown Claude effort level")
         cwd = self.cwd.expanduser().resolve(strict=True)
         if not cwd.is_dir():
             raise ValueError("cwd must be a directory")
         executable = str(self.claude) if self.claude else shutil.which("claude")
         if not executable:
             raise ValueError("Claude Code executable not found")
+        # The path as given, not its link target: a version manager's shim is a link to the
+        # manager, which chooses the program by the name it was called with.
+        claude = Path(executable).expanduser().absolute()
+        if not claude.is_file():
+            raise ValueError(f"Claude Code executable not found: {claude}")
         value = asdict(self)
         value.pop("environment")
-        value.update(cwd=str(cwd), claude=str(Path(executable).expanduser().resolve(strict=True)))
+        value.update(cwd=str(cwd), claude=str(claude))
         return json.loads(json.dumps(value))
 
 

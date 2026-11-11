@@ -21,6 +21,12 @@ import json, os, sys
 if "--version" in sys.argv:
     print("2.1.281 (Claude Code)")
     raise SystemExit(0)
+if os.environ.get("FAKE_CLAUDE_ARGV"):
+    with open(os.environ["FAKE_CLAUDE_ARGV"], "w") as log:
+        json.dump(sys.argv, log)
+if os.environ.get("FAKE_CLAUDE_FAILS"):
+    print("Invalid API key - Please run /login", file=sys.stderr, flush=True)
+    raise SystemExit(1)
 def emit(value):
     print(json.dumps(value), flush=True)
 session = next(a.split("=", 1)[1] for a in sys.argv if a.startswith(("--session-id=", "--resume=")))
@@ -243,3 +249,43 @@ async def test_a_turn_for_another_origin_is_not_ended_by_the_idle_timeout(tmp_pa
         assert settled[1]["message"] == "peer turn done"
     finally:
         await runtime.stop(eid)
+
+
+async def test_effort_reaches_native_claude_and_a_link_to_it_is_not_resolved(tmp_path, native):
+    link = tmp_path / "shim"
+    link.symlink_to(native)
+    opts = LaunchOptions(
+        cwd=tmp_path,
+        claude=link,
+        effort="high",
+        idle_timeout_seconds=0,
+        environment={
+            "FAKE_CLAUDE_LOG": str(tmp_path / "inputs.jsonl"),
+            "FAKE_CLAUDE_ARGV": str(tmp_path / "argv.json"),
+        },
+    )
+    assert opts.configuration()["claude"] == str(link)
+    with pytest.raises(ValueError, match="effort"):
+        LaunchOptions(cwd=tmp_path, claude=native, effort="extreme").configuration()
+    with pytest.raises(ValueError, match="not found"):
+        LaunchOptions(cwd=tmp_path, claude=tmp_path / "missing").configuration()
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    value = await runtime.start("hello", message_id="m1", options=opts, launch_id="effort")
+    try:
+        await wait_for(
+            lambda: runtime.store.receipt(value["session_id"], "m1")["status"] == "delivered"
+        )
+        argv = json.loads((tmp_path / "argv.json").read_text())
+        assert argv[0] == str(link) and argv[argv.index("--effort") + 1] == "high"
+    finally:
+        await runtime.stop(value["execution_id"])
+
+
+async def test_a_native_claude_that_fails_at_its_start_reports_what_it_wrote(tmp_path, native):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = options(tmp_path, native)
+    opts.environment["FAKE_CLAUDE_FAILS"] = "1"
+    value = await runtime.start("hello", message_id="m1", options=opts, launch_id="fails")
+    result = await wait_for(lambda: runtime.inspect(value["execution_id"])["result"])
+    assert result["status"] == "failed" and "Invalid API key - Please run /login" in result["error"]
+    assert runtime.store.receipt(value["session_id"], "m1")["status"] == "rejected"

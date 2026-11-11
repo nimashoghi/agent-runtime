@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import signal
@@ -45,6 +46,13 @@ class Worker:
         self.last_activity = time.monotonic()
         self.background_tasks: set[str] = set()
         self.presentation_started = False
+        # The last lines that native Claude wrote to stderr: its reason when it fails.
+        self.stderr: collections.deque[str] = collections.deque(maxlen=20)
+
+    def native_stderr(self, line: str) -> None:
+        log.debug("claude: %s", line)
+        if line.strip():
+            self.stderr.append(line.rstrip())
 
     def emit(self, kind: str, **fields: Any) -> None:
         self.store.append(self.execution_id, self.session_id, {"type": kind, **fields})
@@ -189,6 +197,7 @@ class Worker:
             permission_mode=policy["permission_mode"],
             allowed_tools=policy["allowed_tools"],
             model=policy["model"],
+            effort=policy.get("effort"),  # absent in the record of an older version
             setting_sources=["user", "project", "local"],
             system_prompt={
                 "type": "preset",
@@ -196,7 +205,7 @@ class Worker:
                 "append": policy["instructions"] or "",
             },
             can_use_tool=self.permission,
-            stderr=lambda line: log.debug("claude: %s", line),
+            stderr=self.native_stderr,
             extra_args={"replay-user-messages": None},
             session_id=self.session_id
             if not self.execution["resume"] or self.execution["fork"]
@@ -276,7 +285,10 @@ class Worker:
                 await asyncio.sleep(0.1)
         except Exception as error:
             log.exception("Claude worker failed")
-            result = {"status": "failed", "error": str(error)}
+            # The SDK's error only points at stderr; the reason is in what Claude wrote there.
+            reason = "\n".join(self.stderr)[-2000:]
+            failure = f"{error}\nClaude wrote: {reason}" if reason else str(error)
+            result = {"status": "failed", "error": failure}
         finally:
             self.stopping.set()
             try:
