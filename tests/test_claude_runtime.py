@@ -1,6 +1,7 @@
 """Exercise the real SDK and detached processes against a deterministic native boundary."""
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -325,11 +326,15 @@ async def test_stderr_from_before_a_result_is_not_reported_with_a_later_failure(
     opts = options(tmp_path, native)
     value = await runtime.start("hello", message_id="m1", options=opts, launch_id="late")
     sid, eid = value["session_id"], value["execution_id"]
-    await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
-    await runtime.submit(sid, "wrong-session", message_id="m2", options=opts, resume=False)
-    result = await wait_for(lambda: runtime.inspect(eid)["result"])
-    assert result["status"] == "failed" and "different session ID" in result["error"]
-    assert "native_stderr" not in result  # the warning at the start came before the first result
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+        await runtime.submit(sid, "wrong-session", message_id="m2", options=opts, resume=False)
+        result = await wait_for(lambda: runtime.inspect(eid)["result"])
+        assert result["status"] == "failed" and "different session ID" in result["error"]
+        # The warning at the start came before the first result.
+        assert "native_stderr" not in result
+    finally:
+        await runtime.stop(eid)
 
 
 async def test_a_launch_id_from_an_older_version_can_be_repeated(tmp_path, native):
@@ -522,8 +527,8 @@ async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_w
 ):
     """A worker closed its execution and is still alive when the session is resumed, so
     `submit` cannot record its exit. It is then killed and leaves no record of its own.
-    Nothing inspects an execution that is not the newest: the worker that gets the lease
-    records it."""
+    A resume does not look at an execution that is not the newest: the worker that gets the
+    lease records it."""
     runtime = ClaudeRuntime(tmp_path / "runtime")
     opts = options(tmp_path, native)
     first = await runtime.start("hold", message_id="m1", options=opts, launch_id="killed")
@@ -543,4 +548,63 @@ async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_w
         assert old["result"]["error"] == "worker exited without a terminal record"
         assert runtime.store.receipt(sid, "m2")["status"] == "rejected"
     finally:
+        # Still there if an assertion failed; gone, or a zombie, otherwise.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(first["pid"], 9)
         await runtime.stop(resumed["execution_id"])
+
+
+async def test_a_worker_that_cannot_be_inspected_is_not_recorded_as_gone(
+    tmp_path, native, monkeypatch
+):
+    """Only proof ends a worker's record: an inspection that fails proves nothing."""
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    value = await runtime.start(
+        "hold", message_id="m1", options=options(tmp_path, native), launch_id="denied"
+    )
+    sid, eid = value["session_id"], value["execution_id"]
+
+    def denied(self, *arguments):
+        raise psutil.AccessDenied(self.pid)
+
+    def crashed(self, *arguments):
+        raise SystemError("<built-in function proc_cmdline> returned a result with an exception")
+
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+        recorded = runtime.store.execution(eid)
+
+        def alive(value):
+            return claude_module.worker_alive(value, runtime.store.root)
+
+        for unreadable in (denied, crashed):
+            with monkeypatch.context() as patch:
+                # The command line cannot be read, and neither can the start time.
+                patch.setattr(psutil.Process, "cmdline", unreadable)
+                patch.setattr(psutil.Process, "create_time", unreadable)
+                assert alive(recorded)
+                assert runtime.inspect(eid)["result"] is None
+            with monkeypatch.context() as patch:
+                # Nothing can be read at all.
+                patch.setattr(psutil.Process, "status", unreadable)
+                patch.setattr(psutil.Process, "create_time", unreadable)
+                assert runtime.inspect(eid)["result"] is None
+        with monkeypatch.context() as patch:
+            # An empty command line (a process in the middle of its start) is no proof.
+            patch.setattr(psutil.Process, "cmdline", lambda self: [])
+            assert alive(recorded)
+            # The one proof for a process that cannot be inspected: the worker took the
+            # session's lease, and the lease is free now. Here another process has the PID
+            # of a worker that was killed (this test process stands for it).
+            patch.setattr(psutil.Process, "cmdline", denied)
+            killed = {**recorded, "session_id": "s-killed", "pid": os.getpid()}
+            assert recorded["leased_at"] and not alive(killed)
+            assert alive({**killed, "leased_at": None})  # it never took the lease: not known
+            with FileLock(str(runtime.store.root / "lease-s-killed.lock")):
+                assert alive(killed)  # held, perhaps by a later worker: not known
+            # A start time that differs is no proof: a step of the clock moves it.
+            patch.setattr(psutil.Process, "create_time", lambda self: 1.0)
+            assert alive(recorded)
+        assert runtime.store.receipt(sid, "m1")["status"] == "delivered"
+    finally:
+        await runtime.stop(eid)

@@ -315,7 +315,6 @@ class Worker:
                 rejection="worker stopped before dispatch",
                 exited_at=time.time(),
             )
-            self.emit("worker.exited", **result)
 
 
 def main() -> None:
@@ -337,7 +336,6 @@ def main() -> None:
             "error": f"another worker of this session did not exit within {LEASE_WAIT_SECONDS:g} s",
         }
         store.finish(identity, result, rejection="worker could not start", exited_at=time.time())
-        store.append(identity, value["session_id"], {"type": "worker.exited", **result})
         raise SystemExit(1) from None
     try:
         # This worker holds the lease, so no other worker of the session runs: a worker
@@ -345,8 +343,8 @@ def main() -> None:
         # killed is free. No other worker waits for the lease either: `submit` makes a
         # new execution only when the newest one is closed, and an execution that waits
         # is closed only together with its result. So an execution without a result is
-        # of a worker that was killed after it closed its execution. Nothing else looks
-        # at an execution that is not the session's newest.
+        # of a worker that was killed after it closed its execution. A resume does not
+        # look at an execution that is not the session's newest.
         for other in store.executions(value["session_id"]):
             if other["execution_id"] != identity and other.get("result") is None:
                 store.finish(
@@ -356,7 +354,13 @@ def main() -> None:
                     observed=True,
                 )
         process = psutil.Process()
-        store.update(identity, pid=process.pid, process_created_at=process.create_time())
+        # `leased_at`: from here on the lease is held, until the last step of this process.
+        store.update(
+            identity,
+            pid=process.pid,
+            process_created_at=process.create_time(),
+            leased_at=time.time(),
+        )
         asyncio.run(Worker(store, identity).run())
     finally:
         lease.release()

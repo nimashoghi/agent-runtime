@@ -31,12 +31,15 @@ def test_the_end_of_an_execution_and_of_its_inputs_is_one_record(tmp_path):
     assert (value["state"], value["result"], value["exited_at"]) == ("exited", FAILED, 1.0)
     view = store.snapshot("s")
     assert view["executions"] == [value]
+    # The event of the exit is part of the same record.
+    assert [item["event"] for item in view["events"]] == [{"type": "worker.exited", **FAILED}]
     assert view["receipts"]["taken"]["status"] == "uncertain"
     assert view["receipts"]["waiting"]["status"] == "rejected"
     assert view["receipts"]["waiting"]["error"] == "worker stopped before dispatch"
     # An observer that only saw the process gone does not replace the worker's own record.
     seen = {"status": "failed", "error": "worker exited without a terminal record"}
     assert store.finish("e1", seen, rejection="x", observed=True) == value
+    assert len(store.events("s")) == 1
     # Without a record of the worker, the observer's record is the result.
     execution(store, "e2")
     assert store.finish("e2", seen, rejection="x", observed=True)["result"] == seen
