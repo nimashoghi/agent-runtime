@@ -3,12 +3,17 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
+import psutil
 import pytest
+from filelock import FileLock
 
-from agent_runtime import ClaudeRuntime, LaunchOptions
+from agent_runtime import ClaudeRuntime, LaunchOptions, worker
+from agent_runtime import claude as claude_module
 
 
 @pytest.fixture
@@ -85,6 +90,9 @@ for line in sys.stdin:
     elif message["type"] == "control_response" and pending:
         result(json.dumps(message["response"]["response"]))
         pending = None
+# The input is closed: the worker ends. A slow exit keeps the worker in its own exit.
+import time
+time.sleep(float(os.environ.get("FAKE_CLAUDE_EXIT_DELAY", "0")))
 """
     )
     cli.chmod(0o700)
@@ -295,6 +303,14 @@ async def test_a_native_claude_that_fails_at_its_start_reports_what_it_wrote(tmp
     opts = options(tmp_path, native)
     opts.environment["FAKE_CLAUDE_FAILS"] = "1"
     value = await runtime.start("hello", message_id="m1", options=opts, launch_id="fails")
+
+    def rejected():
+        view = runtime.store.snapshot(value["session_id"])
+        return view if view["receipts"]["m1"]["status"] == "rejected" else None
+
+    # The first view that has the rejected receipt also has the worker's reason.
+    view = await wait_for(rejected)
+    assert view["executions"][-1]["result"]["native_stderr"]
     result = await wait_for(lambda: runtime.inspect(value["execution_id"])["result"])
     assert result["status"] == "failed" and "Invalid API key" not in result["error"]
     # The last 20 lines, each cut to 500 characters, apart from the error.
@@ -343,3 +359,188 @@ async def test_a_launch_id_from_an_older_version_can_be_repeated(tmp_path, nativ
             await runtime.start("hello", message_id="m1", options=changed, launch_id="old")
     finally:
         await runtime.stop(eid)
+
+
+async def test_a_live_worker_is_known_by_its_command_line_not_by_the_clock(
+    tmp_path, native, monkeypatch
+):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    value = await runtime.start(
+        "hold", message_id="m1", options=options(tmp_path, native), launch_id="clock"
+    )
+    sid, eid = value["session_id"], value["execution_id"]
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+        # A step of the system clock moves the start time that psutil computes on Linux.
+        create_time = psutil.Process.create_time
+        monkeypatch.setattr(psutil.Process, "create_time", lambda self: create_time(self) + 3600)
+        assert runtime.inspect(eid)["result"] is None
+        monkeypatch.undo()
+        # Another process that got a dead worker's PID is not the worker, also when the
+        # recorded start time is its own.
+        other = "e-reused"
+        runtime.store.create_execution(
+            {
+                **runtime.store.execution(eid),
+                "execution_id": other,
+                "session_id": "s-reused",
+                "pid": os.getpid(),
+                "process_created_at": psutil.Process().create_time(),
+            }
+        )
+        runtime.store.accept("s-reused", other, "m1", "never taken")
+        gone = runtime.inspect(other)
+        assert gone["result"]["error"] == "worker exited without a terminal record"
+        assert runtime.store.receipt("s-reused", "m1")["status"] == "rejected"
+    finally:
+        await runtime.stop(eid)
+
+
+async def test_an_input_during_a_workers_idle_exit_resumes_the_session(tmp_path, native):
+    """A worker that decided to exit on idle takes no new input: the input resumes the
+    session, and the new worker waits until the old one is gone. Native Claude takes a
+    second to exit here, so the input arrives while the old worker ends."""
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = LaunchOptions(
+        cwd=tmp_path,
+        claude=native,
+        idle_timeout_seconds=0.3,
+        environment={
+            "FAKE_CLAUDE_LOG": str(tmp_path / "inputs.jsonl"),
+            "FAKE_CLAUDE_EXIT_DELAY": "1",
+        },
+    )
+    value = await runtime.start("hello", message_id="m1", options=opts, launch_id="idle")
+    sid, first = value["session_id"], value["execution_id"]
+
+    def settled(message_id):
+        return any(
+            e["event"]["type"] == "work.settled" and message_id in e["event"]["message_ids"]
+            for e in runtime.store.events(sid)
+        )
+
+    try:
+        await wait_for(lambda: settled("m1"))
+        # The worker closes its execution when it decides to exit, and records the exit
+        # only after native Claude is gone.
+        await wait_for(lambda: runtime.store.execution(first)["state"] == "stopping")
+        assert runtime.inspect(first)["result"] is None
+        receipt = await runtime.submit(sid, "next", message_id="m2", options=opts, resume=True)
+        assert receipt["execution_id"] != first and receipt["status"] == "accepted"
+        await wait_for(lambda: settled("m2"))
+        assert runtime.store.receipt(sid, "m2")["status"] == "delivered"
+        assert runtime.store.execution(first)["result"] == {
+            "status": "completed",
+            "reason": "idle_timeout",
+        }
+    finally:
+        await runtime.stop(runtime.store.latest(sid)["execution_id"])
+
+
+async def test_a_resumed_worker_waits_for_the_lease_of_the_worker_before_it(tmp_path, native):
+    root = tmp_path / "runtime"
+    runtime = ClaudeRuntime(root)
+    opts = options(tmp_path, native)
+    first = await runtime.start("hello", message_id="m1", options=opts, launch_id="lease")
+    sid = first["session_id"]
+    await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+    await runtime.stop(first["execution_id"])
+    # The test stands for a worker that recorded its exit and still ends.
+    lease = FileLock(str(root / f"lease-{sid}.lock"))
+    lease.acquire(timeout=10)  # the stopped worker frees it a moment after its record
+    try:
+        resumed = await runtime.submit(sid, "later", message_id="m2", options=opts, resume=True)
+        await asyncio.sleep(1)
+        waiting = runtime.inspect(resumed["execution_id"])
+        assert waiting["result"] is None and waiting["state"] == "starting"
+        assert runtime.store.receipt(sid, "m2")["status"] == "accepted"
+    finally:
+        lease.release()
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m2")["status"] == "delivered")
+    finally:
+        await runtime.stop(resumed["execution_id"])
+
+
+def test_a_worker_that_does_not_get_the_lease_records_why(tmp_path, monkeypatch):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    runtime.store.create_execution(
+        {
+            "provider": "claude_code",
+            "execution_id": "e1",
+            "session_id": "s",
+            "created_at": time.time(),
+            "state": "starting",
+            "result": None,
+        }
+    )
+    runtime.store.accept("s", "e1", "m1", "do it")
+    monkeypatch.setattr(worker, "LEASE_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(sys, "argv", ["worker", str(runtime.store.root), "e1"])
+    monkeypatch.setattr(os, "umask", lambda mask: 0o077)  # main sets the process's umask
+    with FileLock(str(runtime.store.root / "lease-s.lock")), pytest.raises(SystemExit):
+        worker.main()
+    value = runtime.store.execution("e1")
+    assert value["state"] == "exited" and "did not exit within 0.2 s" in value["result"]["error"]
+    assert runtime.store.receipt("s", "m1")["status"] == "rejected"
+
+
+async def test_a_launch_whose_record_fails_leaves_no_worker(tmp_path, native, monkeypatch):
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    children = []
+
+    class Recorded(subprocess.Popen):
+        def __init__(self, *arguments, **options):
+            super().__init__(*arguments, **options)
+            children.append(self)
+
+    def no_record(identity, **fields):
+        raise OSError("the record cannot be written")
+
+    monkeypatch.setattr(claude_module.subprocess, "Popen", Recorded)
+    monkeypatch.setattr(runtime.store, "update", no_record)
+    with pytest.raises(OSError, match="cannot be written"):
+        await runtime.start(
+            "hello", message_id="m1", options=options(tmp_path, native), launch_id="no-record"
+        )
+    (child,) = children
+    assert child.returncode is not None  # ended and collected
+    monkeypatch.undo()
+    value = runtime.store.execution(_only_execution(runtime))
+    assert value["result"] == {"status": "failed", "error": "the record cannot be written"}
+    assert runtime.store.receipt(value["session_id"], "m1")["status"] == "rejected"
+
+
+def _only_execution(runtime: ClaudeRuntime) -> str:
+    with runtime.store.connect() as db:
+        (row,) = db.execute("SELECT id FROM executions").fetchall()
+    return row[0]
+
+
+async def test_a_worker_that_was_killed_while_stopping_is_recorded_by_the_next_worker(
+    tmp_path, native
+):
+    """A worker closed its execution and is still alive when the session is resumed, so
+    `submit` cannot record its exit. It is then killed and leaves no record of its own.
+    Nothing inspects an execution that is not the newest: the worker that gets the lease
+    records it."""
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    opts = options(tmp_path, native)
+    first = await runtime.start("hold", message_id="m1", options=opts, launch_id="killed")
+    sid, eid = first["session_id"], first["execution_id"]
+    await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+    runtime.store.accept(sid, eid, "m2", "never taken")
+    runtime.store.close_to_inputs(eid)
+    resumed = await runtime.submit(sid, "later", message_id="m3", options=opts, resume=True)
+    try:
+        assert resumed["execution_id"] != eid
+        await asyncio.sleep(1)  # the new worker waits for the lease of the old one
+        assert runtime.store.execution(eid)["result"] is None
+        assert runtime.store.execution(resumed["execution_id"])["state"] == "starting"
+        os.killpg(runtime.store.execution(eid)["pid"], 9)
+        await wait_for(lambda: runtime.store.receipt(sid, "m3")["status"] == "delivered")
+        old = runtime.store.execution(eid)
+        assert old["result"]["error"] == "worker exited without a terminal record"
+        assert runtime.store.receipt(sid, "m2")["status"] == "rejected"
+    finally:
+        await runtime.stop(resumed["execution_id"])

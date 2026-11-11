@@ -27,12 +27,15 @@ from claude_agent_sdk import (
     ToolPermissionContext,
     UserMessage,
 )
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from agent_runtime.monitors import Monitors
 from agent_runtime.store import Store
 
 log = logging.getLogger(__name__)
+
+# How long a new worker waits for the worker before it to release the session.
+LEASE_WAIT_SECONDS = 30.0
 
 
 class Worker:
@@ -146,35 +149,34 @@ class Worker:
                 status = "failed" if message.is_error else "completed"
                 if message.terminal_reason in {"aborted_streaming", "aborted_tools"}:
                     status = "interrupted"
-                self.emit(
-                    "agent.turn.completed",
-                    status=status,
-                    origin=message.origin,
-                    terminal_reason=message.terminal_reason,
-                    usage=message.usage,
-                )
-                self.emit(
-                    "work.settled",
-                    status=status,
-                    message=message.result or "",
-                    message_ids=[active["id"]] if active else [],
-                    origin=message.origin,
-                    errors=message.errors,
-                    error="; ".join(message.errors or []) or None,
-                    last_turn_status=status,
+                # The settlement, and with it the receipt of an input whose echo was lost
+                # (it becomes uncertain), in one transaction.
+                self.store.settle(
+                    self.execution_id,
+                    self.session_id,
+                    [
+                        {
+                            "type": "agent.turn.completed",
+                            "status": status,
+                            "origin": message.origin,
+                            "terminal_reason": message.terminal_reason,
+                            "usage": message.usage,
+                        },
+                        {
+                            "type": "work.settled",
+                            "status": status,
+                            "message": message.result or "",
+                            "message_ids": [active["id"]] if active else [],
+                            "origin": message.origin,
+                            "errors": message.errors,
+                            "error": "; ".join(message.errors or []) or None,
+                            "last_turn_status": status,
+                        },
+                    ],
+                    active["id"] if active else None,
                 )
                 self.presentation_started = False
                 if active:
-                    receipt = self.store.receipt(self.session_id, active["id"])
-                    if receipt and receipt["status"] == "dispatching":
-                        # A result does not identify which input UUID it accepted.
-                        # Preserve uncertainty if the expected native echo was lost.
-                        self.store.input_status(
-                            self.session_id,
-                            active["id"],
-                            "uncertain",
-                            error="native result arrived without input UUID acknowledgement",
-                        )
                     self.active = None
             else:
                 data = getattr(message, "data", {})
@@ -281,6 +283,9 @@ class Worker:
                         monitor["status"] in {"starting", "running"}
                         for monitor in Monitors().list(self.session_id)
                     )
+                    # An input can arrive at this moment. The execution closes to new inputs
+                    # only if none waits; one that waits is taken in the next pass.
+                    and self.store.close_to_inputs(self.execution_id, unless_input_waits=True)
                 ):
                     result = {"status": "completed", "reason": "idle_timeout"}
                     break
@@ -293,16 +298,22 @@ class Worker:
         finally:
             self.stopping.set()
             try:
+                # From here on a new input goes to a resumed execution, not to this worker.
+                self.store.close_to_inputs(self.execution_id)
+            except Exception:
+                log.exception("closing the execution to new inputs failed")
+            try:
                 await client.disconnect()
             except Exception:
                 log.exception("Claude disconnect failed")
             if reader is not None:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            self.store.lose_dispatches(self.execution_id)
-            self.store.reject_pending(self.execution_id, "worker stopped before dispatch")
-            self.store.update(
-                self.execution_id, state="exited", result=result, exited_at=time.time()
+            self.store.finish(
+                self.execution_id,
+                result,
+                rejection="worker stopped before dispatch",
+                exited_at=time.time(),
             )
             self.emit("worker.exited", **result)
 
@@ -314,10 +325,41 @@ def main() -> None:
     )
     store, identity = Store(Path(sys.argv[1])), sys.argv[2]
     value = store.execution(identity)
-    with FileLock(str(store.root / f"lease-{value['session_id']}.lock"), timeout=0):
+    # One worker per session. The worker of a resumed session can start while the worker
+    # before it still ends (it records its exit a moment before its process is gone), so it
+    # waits for the lease.
+    lease = FileLock(str(store.root / f"lease-{value['session_id']}.lock"))
+    try:
+        lease.acquire(timeout=LEASE_WAIT_SECONDS)
+    except Timeout:
+        result = {
+            "status": "failed",
+            "error": f"another worker of this session did not exit within {LEASE_WAIT_SECONDS:g} s",
+        }
+        store.finish(identity, result, rejection="worker could not start", exited_at=time.time())
+        store.append(identity, value["session_id"], {"type": "worker.exited", **result})
+        raise SystemExit(1) from None
+    try:
+        # This worker holds the lease, so no other worker of the session runs: a worker
+        # records its exit before it releases the lease, and the lease of one that was
+        # killed is free. No other worker waits for the lease either: `submit` makes a
+        # new execution only when the newest one is closed, and an execution that waits
+        # is closed only together with its result. So an execution without a result is
+        # of a worker that was killed after it closed its execution. Nothing else looks
+        # at an execution that is not the session's newest.
+        for other in store.executions(value["session_id"]):
+            if other["execution_id"] != identity and other.get("result") is None:
+                store.finish(
+                    other["execution_id"],
+                    {"status": "failed", "error": "worker exited without a terminal record"},
+                    rejection="worker exited before dispatch",
+                    observed=True,
+                )
         process = psutil.Process()
         store.update(identity, pid=process.pid, process_created_at=process.create_time())
         asyncio.run(Worker(store, identity).run())
+    finally:
+        lease.release()
 
 
 if __name__ == "__main__":
