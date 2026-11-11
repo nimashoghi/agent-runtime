@@ -133,7 +133,7 @@ def _lease_is_free(value: dict[str, Any], root: Path) -> bool:
     lease = FileLock(str(root / f"lease-{value['session_id']}.lock"))
     try:
         lease.acquire(timeout=0)
-    except Timeout:
+    except (Timeout, OSError):  # held, or the lock cannot be tried: not known
         return False
     lease.release()
     return True

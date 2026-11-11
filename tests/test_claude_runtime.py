@@ -326,11 +326,15 @@ async def test_stderr_from_before_a_result_is_not_reported_with_a_later_failure(
     opts = options(tmp_path, native)
     value = await runtime.start("hello", message_id="m1", options=opts, launch_id="late")
     sid, eid = value["session_id"], value["execution_id"]
-    await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
-    await runtime.submit(sid, "wrong-session", message_id="m2", options=opts, resume=False)
-    result = await wait_for(lambda: runtime.inspect(eid)["result"])
-    assert result["status"] == "failed" and "different session ID" in result["error"]
-    assert "native_stderr" not in result  # the warning at the start came before the first result
+    try:
+        await wait_for(lambda: runtime.store.receipt(sid, "m1")["status"] == "delivered")
+        await runtime.submit(sid, "wrong-session", message_id="m2", options=opts, resume=False)
+        result = await wait_for(lambda: runtime.inspect(eid)["result"])
+        assert result["status"] == "failed" and "different session ID" in result["error"]
+        # The warning at the start came before the first result.
+        assert "native_stderr" not in result
+    finally:
+        await runtime.stop(eid)
 
 
 async def test_a_launch_id_from_an_older_version_can_be_repeated(tmp_path, native):

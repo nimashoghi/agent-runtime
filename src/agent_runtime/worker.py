@@ -315,7 +315,6 @@ class Worker:
                 rejection="worker stopped before dispatch",
                 exited_at=time.time(),
             )
-            self.emit("worker.exited", **result)
 
 
 def main() -> None:
@@ -337,7 +336,6 @@ def main() -> None:
             "error": f"another worker of this session did not exit within {LEASE_WAIT_SECONDS:g} s",
         }
         store.finish(identity, result, rejection="worker could not start", exited_at=time.time())
-        store.append(identity, value["session_id"], {"type": "worker.exited", **result})
         raise SystemExit(1) from None
     try:
         # This worker holds the lease, so no other worker of the session runs: a worker
@@ -356,7 +354,7 @@ def main() -> None:
                     observed=True,
                 )
         process = psutil.Process()
-        # `leased_at`: from here to the end of this process, the lease is held.
+        # `leased_at`: from here on the lease is held, until the last step of this process.
         store.update(
             identity,
             pid=process.pid,

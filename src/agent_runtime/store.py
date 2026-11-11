@@ -147,8 +147,9 @@ class Store:
         observed: bool = False,
         **fields: Any,
     ) -> dict[str, Any]:
-        """Record the end of an execution and of its open inputs in one transaction: a
-        reader sees the result together with the receipts that it explains, or neither.
+        """Record the end of an execution and of its open inputs in one transaction, with
+        the `worker.exited` event: a reader sees the result together with the receipts that
+        it explains and with the event, or none of them.
 
         An input that was being dispatched becomes `uncertain`, and one that was not taken
         becomes `rejected` with `rejection` as its error. `observed` is for a caller that is
@@ -175,6 +176,10 @@ class Store:
             )
             value = {**value, **fields, "state": "exited", "result": result}
             db.execute("UPDATE executions SET value=? WHERE id=?", (json.dumps(value), identity))
+            db.execute(
+                "INSERT INTO events(execution_id,session_id,value) VALUES(?,?,?)",
+                (identity, value["session_id"], json.dumps({"type": "worker.exited", **result})),
+            )
         return value
 
     def accept(
