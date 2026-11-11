@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import signal
@@ -45,6 +46,14 @@ class Worker:
         self.last_activity = time.monotonic()
         self.background_tasks: set[str] = set()
         self.presentation_started = False
+        # The last lines that native Claude wrote to stderr since its last result. When the
+        # worker fails, they go into its result apart from the error: they are often the
+        # reason (the SDK's error only says to check stderr), but not always.
+        self.stderr: collections.deque[str] = collections.deque(maxlen=20)
+
+    def native_stderr(self, line: str) -> None:
+        log.debug("claude: %s", line)
+        self.stderr.append(line[:500])
 
     def emit(self, kind: str, **fields: Any) -> None:
         self.store.append(self.execution_id, self.session_id, {"type": kind, **fields})
@@ -123,6 +132,7 @@ class Worker:
             elif isinstance(message, ResultMessage):
                 if message.session_id != self.session_id:
                     raise RuntimeError("native Claude returned a different session ID")
+                self.stderr.clear()  # what it wrote before a result is not about a later failure
                 human = message.origin is None or message.origin.get("kind") == "human"
                 # Native Claude can fold an input into a turn that something else started
                 # (a peer message, a background task); that turn's result carries the other
@@ -189,6 +199,7 @@ class Worker:
             permission_mode=policy["permission_mode"],
             allowed_tools=policy["allowed_tools"],
             model=policy["model"],
+            effort=policy.get("effort"),  # absent in the record of an older version
             setting_sources=["user", "project", "local"],
             system_prompt={
                 "type": "preset",
@@ -196,7 +207,7 @@ class Worker:
                 "append": policy["instructions"] or "",
             },
             can_use_tool=self.permission,
-            stderr=lambda line: log.debug("claude: %s", line),
+            stderr=self.native_stderr,
             extra_args={"replay-user-messages": None},
             session_id=self.session_id
             if not self.execution["resume"] or self.execution["fork"]
@@ -277,6 +288,8 @@ class Worker:
         except Exception as error:
             log.exception("Claude worker failed")
             result = {"status": "failed", "error": str(error)}
+            if self.stderr:
+                result["native_stderr"] = list(self.stderr)
         finally:
             self.stopping.set()
             try:
