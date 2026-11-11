@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib.util
 import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -91,6 +93,30 @@ def process_alive(value: dict[str, Any]) -> bool:
         return False
 
 
+def worker_alive(value: dict[str, Any]) -> bool:
+    """Whether the worker process of an execution runs.
+
+    The worker is known by its command line, which names the execution. A reused PID cannot
+    carry it, and it does not depend on the clock: a start time does (psutil on Linux
+    computes it from the boot time, which a step of the system clock moves), and a live
+    worker must never be recorded as gone."""
+    if not value.get("pid"):
+        return False
+    try:
+        process = psutil.Process(value["pid"])
+        if process.status() == psutil.STATUS_ZOMBIE:
+            return False
+        command = process.cmdline()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError, SystemError):
+        # The command line cannot be read: on macOS, a process that is ending or one of
+        # another user (psutil raises AccessDenied or SystemError). There the start time
+        # comes from the kernel's record of the process and does not move.
+        return process_alive(value)
+    return "agent_runtime.worker" in command and value["execution_id"] in command
+
+
 class ClaudeRuntime:
     """The client owns no worker lifetime and can reconnect after a service restart."""
 
@@ -101,16 +127,16 @@ class ClaudeRuntime:
 
     def inspect(self, execution_id: str) -> dict[str, Any]:
         value = self.store.execution(execution_id)
-        if value.get("result") is not None or process_alive(value):
+        if value.get("result") is not None or worker_alive(value):
             return value
         if not value.get("pid") and time.time() - value["created_at"] < 60:
             return value
-        self.store.lose_dispatches(execution_id)
-        self.store.reject_pending(execution_id, "worker exited before dispatch")
-        return self.store.update(
+        # The worker can have recorded its own exit since the read above; that record stays.
+        return self.store.finish(
             execution_id,
-            state="exited",
-            result={"status": "failed", "error": "worker exited without a terminal record"},
+            {"status": "failed", "error": "worker exited without a terminal record"},
+            rejection="worker exited before dispatch",
+            observed=True,
         )
 
     async def start(
@@ -185,6 +211,7 @@ class ClaudeRuntime:
             environment.update(AGENT_SESSION_PROVIDER="claude_code", AGENT_SESSION_ID=session_id)
             log = self.store.root / f"{execution_id}.log"
             fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            child: subprocess.Popen[bytes] | None = None
             try:
                 with os.fdopen(fd, "ab", buffering=0) as output:
                     child = subprocess.Popen(
@@ -211,9 +238,16 @@ class ClaudeRuntime:
                     process_created_at=psutil.Process(child.pid).create_time(),
                 )
             except Exception as error:
-                self.store.reject_pending(execution_id, "worker could not start")
-                self.store.update(
-                    execution_id, state="exited", result={"status": "failed", "error": str(error)}
+                if child is not None:
+                    # The worker started but has no usable record: it must not run. It is
+                    # the leader of its own process group (`start_new_session`).
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                self.store.finish(
+                    execution_id,
+                    {"status": "failed", "error": str(error)},
+                    rejection="worker could not start",
                 )
                 raise
             return self.store.execution(execution_id)
@@ -221,32 +255,36 @@ class ClaudeRuntime:
     async def submit(
         self, session_id: str, text: str, *, message_id: str, options: LaunchOptions, resume: bool
     ) -> dict[str, Any]:
-        # Admission is serialized with process exit/resume decisions. Each new
-        # execution also obtains a lifetime lease before connecting the native CLI.
+        # Submissions of one session are serialized. A worker closes its execution to new
+        # inputs before it exits (`Store.close`), and `Store.accept` refuses a closed one in
+        # the same transaction, so an input is never given to a worker that is on its way
+        # out: it goes to a resumed execution, whose worker waits for the session's lease
+        # until the old worker is gone.
         with FileLock(str(self.store.root / f"submit-{session_id}.lock")):
             if saved := self.store.receipt(session_id, message_id):
                 self.inspect(saved["execution_id"])
-                return self.store.accept(session_id, saved["execution_id"], message_id, text)
+                receipt = self.store.accept(session_id, saved["execution_id"], message_id, text)
+                assert receipt is not None  # a message ID with a receipt returns it
+                return receipt
             latest = self.store.latest(session_id)
             if latest is None:
                 raise KeyError("unknown managed Claude session")
             latest = self.inspect(latest["execution_id"])
-            if latest.get("result") is not None:
-                if not resume:
-                    return {
-                        "message_id": message_id,
-                        "execution_id": latest["execution_id"],
-                        "status": "rejected",
-                        "error": "session is stopped; explicit resume required",
-                    }
-                identity = str(
-                    uuid.uuid5(uuid.NAMESPACE_URL, f"claude-resume:{session_id}:{message_id}")
-                )
-                self._launch(
-                    identity, session_id, text, message_id, options, resume=session_id, fork=False
-                )
-            else:
-                self.store.accept(session_id, latest["execution_id"], message_id, text)
+            if receipt := self.store.accept(session_id, latest["execution_id"], message_id, text):
+                return receipt
+            if not resume:
+                return {
+                    "message_id": message_id,
+                    "execution_id": latest["execution_id"],
+                    "status": "rejected",
+                    "error": "session is stopped; explicit resume required",
+                }
+            identity = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"claude-resume:{session_id}:{message_id}")
+            )
+            self._launch(
+                identity, session_id, text, message_id, options, resume=session_id, fork=False
+            )
             receipt = self.store.receipt(session_id, message_id)
             assert receipt is not None
             return receipt
