@@ -356,7 +356,13 @@ def main() -> None:
                     observed=True,
                 )
         process = psutil.Process()
-        store.update(identity, pid=process.pid, process_created_at=process.create_time())
+        # `leased_at`: from here to the end of this process, the lease is held.
+        store.update(
+            identity,
+            pid=process.pid,
+            process_created_at=process.create_time(),
+            leased_at=time.time(),
+        )
         asyncio.run(Worker(store, identity).run())
     finally:
         lease.release()

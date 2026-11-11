@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import psutil
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from agent_runtime.store import Store
 
@@ -93,54 +93,50 @@ def process_alive(value: dict[str, Any]) -> bool:
         return False
 
 
-def worker_alive(value: dict[str, Any]) -> bool:
-    """Whether the worker process of an execution runs.
+def worker_alive(value: dict[str, Any], root: Path) -> bool:
+    """Whether the worker process of an execution runs. `root` is the store's folder.
 
     The worker is known by its command line, which names the execution. A reused PID cannot
-    carry it, and it does not depend on the clock: a start time does (psutil on Linux
-    computes it from the boot time, which a step of the system clock moves).
+    carry it, and it does not depend on the clock: a start time does (psutil computes it
+    from the boot time, which a step of the system clock moves).
 
-    Only proof makes the answer false: no such process, a zombie, or a process that is
-    shown to be another one. A process that cannot be inspected counts as running. A
-    caller records a worker as gone on a false answer, and that record must never be made
-    for a live worker."""
+    Only proof makes the answer false: no such process, a zombie, a process that is shown
+    to be another one, or a free session lease after this worker took it. A process that
+    cannot be inspected otherwise counts as running. A caller records a worker as gone on
+    a false answer, and that record must never be made for a live worker."""
     if not value.get("pid"):
         return False
     try:
         process = psutil.Process(value["pid"])
-    except psutil.NoSuchProcess:
-        return False
-    except (psutil.Error, OSError, SystemError):
-        return True  # not known
-    try:
         if process.status() == psutil.STATUS_ZOMBIE:
             return False
         command = process.cmdline()
     except psutil.NoSuchProcess:
         return False
     except (psutil.Error, OSError, SystemError):
-        # The command line cannot be read: on macOS, a process that is ending or one of
-        # another user (psutil raises AccessDenied or SystemError).
-        return _started_as_recorded(process, value)
+        # The process cannot be inspected: on macOS, one that is ending or one of another
+        # user (psutil raises AccessDenied or SystemError).
+        return not _lease_is_free(value, root)
     if not command:
-        # No arguments yet (Linux, a process in the middle of its start).
-        return _started_as_recorded(process, value)
+        # No arguments (Linux: a process in the middle of its start, or a kernel thread).
+        return not _lease_is_free(value, root)
     return "agent_runtime.worker" in command and value["execution_id"] in command
 
 
-def _started_as_recorded(process: psutil.Process, value: dict[str, Any]) -> bool:
-    """For a process whose command line says nothing: false only when its start time proves
-    that it is not the recorded process."""
-    try:
-        started = process.create_time()
-    except psutil.NoSuchProcess:
+def _lease_is_free(value: dict[str, Any], root: Path) -> bool:
+    """Whether the worker of this execution took the session's lease and nothing holds it
+    now. A worker holds the lease from then to the end of its process, also when it is
+    killed, so this is proof that the worker is gone; it needs no clock, PID or permission.
+    (A lease that is held proves nothing: the holder can be a later worker.)"""
+    if not value.get("leased_at"):
         return False
-    except (psutil.Error, OSError, SystemError):
-        return True  # not known
-    if sys.platform == "linux" or not value.get("process_created_at"):
-        # On Linux a start time moves with the system clock, so a difference is no proof.
-        return True
-    return abs(started - value["process_created_at"]) < 0.01
+    lease = FileLock(str(root / f"lease-{value['session_id']}.lock"))
+    try:
+        lease.acquire(timeout=0)
+    except Timeout:
+        return False
+    lease.release()
+    return True
 
 
 class ClaudeRuntime:
@@ -153,7 +149,7 @@ class ClaudeRuntime:
 
     def inspect(self, execution_id: str) -> dict[str, Any]:
         value = self.store.execution(execution_id)
-        if value.get("result") is not None or worker_alive(value):
+        if value.get("result") is not None or worker_alive(value, self.store.root):
             return value
         if not value.get("pid") and time.time() - value["created_at"] < 60:
             return value
