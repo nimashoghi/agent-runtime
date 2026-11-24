@@ -16,8 +16,11 @@ def _boot() -> str:
     """This boot of the machine on Linux, so that a start token never repeats
     across restarts; elsewhere the start is calendar time, which does not. An
     unreadable boot ID raises, so that no token is made without it."""
-    boot_id = Path("/proc/sys/kernel/random/boot_id")
-    return boot_id.read_text().strip() + ":" if Path("/proc").is_dir() else ""
+    if not Path("/proc").is_dir():
+        return ""
+    if not (boot := Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
+        raise OSError("the boot ID is empty")
+    return boot + ":"
 
 
 def start_token(process: psutil.Process) -> str:

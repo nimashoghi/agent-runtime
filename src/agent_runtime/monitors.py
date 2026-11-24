@@ -5,12 +5,10 @@ from __future__ import annotations
 import json
 import math
 import os
-import signal
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -63,17 +61,11 @@ class Monitors:
         value = json.loads(row[0])
         gone = bool(value.get("pid")) and not _worker_alive(value)
         if gone and value["status"] in {"running", "starting"}:
-            value = self.update(monitor_id, status="interrupted", error="monitor worker exited")
+            value = self._interrupt(monitor_id, value["pid"])
         if gone and "start_token" in value.get("owner", {}):
-            # An agy worker delivers its own events. One that died while sending
+            # An agy worker delivers its own events; one that died while sending
             # (also its final notice, after the command's outcome) leaves its
-            # agentapi call running with the token, and its batch neither sent
-            # nor pending. Repeating this changes nothing.
-            if isinstance(sender := value.get("sender"), dict):
-                if lifetime_alive(sender["pid"], sender["start_token"]):
-                    with suppress(ProcessLookupError):
-                        os.kill(sender["pid"], signal.SIGKILL)
-                value = self.update(monitor_id, sender=None)
+            # batch neither sent nor pending. Repeating this changes nothing.
             self.interrupted_delivery(value["session_id"], monitor_id=monitor_id)
         if (
             value["status"] == "starting"
@@ -83,6 +75,21 @@ class Monitors:
             value = self.update(
                 monitor_id, status="interrupted", error="monitor worker did not start"
             )
+        return value
+
+    def _interrupt(self, monitor_id: str, pid: int) -> dict[str, Any]:
+        """Record that the worker exited, unless it recorded an outcome meanwhile."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = json.loads(row[0])
+            if value["status"] in {"running", "starting"} and value.get("pid") == pid:
+                value.update(
+                    status="interrupted", error="monitor worker exited", updated_at=time.time()
+                )
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
         return value
 
     def update(self, monitor_id: str, **fields: Any) -> dict[str, Any]:

@@ -3,6 +3,7 @@
 import itertools
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -35,7 +36,10 @@ time.sleep(300)
 
 # Records each call and whether it got the session's credentials, never their values.
 AGENTAPI = """\
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
+
+if pathlib.Path(RECORD + ".block").exists():
+    time.sleep(5)  # a send that is still running
 
 with open(RECORD, "a") as record:
     record.write(json.dumps({
@@ -165,6 +169,7 @@ class Agy:
             "transcriptPath": str(self.tmp / "transcript_full.jsonl"),
             "cwd": str(self.tmp),
             "hookEventName": "PreToolUse",
+            "modelName": "gemini",
             "toolCall": {"id": "call_1", "name": "run_command", "args": {"CommandLine": "x"}},
         }
         steps = []
@@ -264,6 +269,21 @@ def test_a_persistent_monitor_keeps_its_output_for_the_resumed_session(conversat
     assert not agy.calls()
 
 
+def test_a_worker_that_dies_while_sending_leaves_its_batch_uncertain(conversation):
+    agy = conversation
+    (agy.tmp / "agentapi.jsonl.block").touch()
+    _process, monitor = agy.run(
+        {"name": "start", "command": "echo one; sleep 3", "persistent": True}
+    )
+    monitors = Monitors(agy.state)
+    wait_for(lambda: any(event["status"] == "dispatching" for event in agy.events()))
+    os.kill(monitors.get(monitor["monitor_id"])["pid"], signal.SIGKILL)
+    wait_for(lambda: monitors.get(monitor["monitor_id"])["status"] == "interrupted")
+    (event,) = agy.events()
+    assert (event["text"], event["status"]) == ("one", "uncertain")
+    assert event["error"] == "delivery exited during a delivery attempt"
+
+
 def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
     agy = conversation
     (agy.tmp / "agentapi.jsonl.fail").touch()
@@ -331,6 +351,7 @@ def test_a_hook_outside_its_agy_process_does_not_register(tmp_path, monkeypatch)
         "transcriptPath": str(tmp_path / "t.jsonl"),
         "cwd": str(tmp_path),
         "hookEventName": "SessionStart",
+        "modelName": "gemini",
     }
 
     with pytest.raises(RuntimeError, match="no ancestor"):

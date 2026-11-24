@@ -15,6 +15,7 @@ import psutil
 from platformdirs import user_state_path
 
 from agent_runtime.claude import process_alive
+from agent_runtime.processes import agy_conversation
 from agent_runtime.store import Store
 
 Provider = Literal["codex", "claude_code", "agy"]
@@ -224,6 +225,7 @@ def send_claude_peer(
     provider, source_id = source_identity or current_identity()
     if provider == "agy":
         # agy hooks report no permission mode, so an agy source gets the cautious class.
+        agy_conversation(source_id)
         mode = "prompting"
     else:
         mode = permission_class(records.get(provider, source_id).get("permission_mode"))

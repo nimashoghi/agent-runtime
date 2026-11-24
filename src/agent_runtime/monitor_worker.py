@@ -13,7 +13,7 @@ import psutil
 from agent_runtime import agy
 from agent_runtime.authority import without_agy
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import agy_alive, lifetime_alive, owner_alive, start_token
+from agent_runtime.processes import agy_alive, owner_alive, start_token
 
 
 async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -28,18 +28,12 @@ async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
     return child.returncode is not None
 
 
-def _token(pid: int) -> str | None:
-    """The start token of a process, or None when it is gone or hidden."""
-    try:
-        return start_token(psutil.Process(pid))
-    except (psutil.Error, OSError):
-        return None
-
-
-def _runs(pid: int, token: str | None) -> bool:
-    """Whether this process lifetime runs; judged by its start token, so a clock
-    step does not hide it."""
-    return token is not None and lifetime_alive(pid, token) is not False
+def _running(process: psutil.Process | None) -> bool:
+    """Whether this exact process still runs: psutil's is_running() compares the
+    lifetime it saw first, so a PID that changed hands does not count."""
+    return (
+        process is not None and process.is_running() and (process.status() != psutil.STATUS_ZOMBIE)
+    )
 
 
 async def run(directory: Path, identity: str) -> None:
@@ -48,13 +42,10 @@ async def run(directory: Path, identity: str) -> None:
     monitors = Monitors(directory)
     value = monitors.get(identity)
     process = psutil.Process()
-    monitors.update(
-        identity,
-        status="running",
-        pid=process.pid,
-        process_created_at=process.create_time(),
-        start_token=start_token(process),
-    )
+    lifetime = {"pid": process.pid, "process_created_at": process.create_time()}
+    with suppress(OSError):  # without it, readers judge the worker by creation time
+        lifetime["start_token"] = start_token(process)
+    monitors.update(identity, status="running", **lifetime)
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
@@ -66,8 +57,8 @@ async def run(directory: Path, identity: str) -> None:
         # credentials of the command that started it; nothing else claims them.
         delivery = asyncio.create_task(_deliver(monitors, identity, owner, finished))
     child = None
-    child_token = None
-    descendants: dict[int, str | None] = {}
+    child_process: psutil.Process | None = None
+    descendants: list[psutil.Process] = []
     started = time.monotonic()
     timed_out = False
     readers = []
@@ -90,7 +81,8 @@ async def run(directory: Path, identity: str) -> None:
             env=without_agy(dict(os.environ)),
             start_new_session=True,
         )
-        child_token = _token(child.pid)
+        with suppress(psutil.NoSuchProcess):
+            child_process = psutil.Process(child.pid)
 
         async def read(stream, *, observations: bool):
             buffer = b""
@@ -125,11 +117,11 @@ async def run(directory: Path, identity: str) -> None:
             asyncio.create_task(read(child.stderr, observations=False)),
         ]
         while child.returncode is None:
-            if child_token is not None:
+            if child_process is not None:
                 try:
-                    for descendant in psutil.Process(child.pid).children(recursive=True):
-                        if descendant.pid not in descendants:
-                            descendants[descendant.pid] = _token(descendant.pid)
+                    for descendant in child_process.children(recursive=True):
+                        if descendant not in descendants:  # psutil compares lifetimes
+                            descendants.append(descendant)
                 except psutil.NoSuchProcess:
                     pass
             state = monitors.get(identity)
@@ -139,9 +131,9 @@ async def run(directory: Path, identity: str) -> None:
             if state.get("stop_requested") or (not value["persistent"] and not owner_alive(owner)):
                 stop.set()
             if stop.is_set():
-                if _runs(child.pid, child_token):
+                if _running(child_process):
                     os.killpg(child.pid, signal.SIGTERM)
-                    if not await exited(child, 5) and _runs(child.pid, child_token):
+                    if not await exited(child, 5) and _running(child_process):
                         os.killpg(child.pid, signal.SIGKILL)
                 break
             for reader in readers:
@@ -173,59 +165,60 @@ async def run(directory: Path, identity: str) -> None:
         monitors.append(identity, f"Monitor {identity} failed: {error}")
         raise
     finally:
-        for pid, token in descendants.items():
-            if _runs(pid, token):
-                with suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
+        for descendant in descendants:
+            # kill() checks that the PID still belongs to this lifetime.
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                descendant.kill()
         if child is not None and child.returncode is None:
-            if _runs(child.pid, child_token):
+            if _running(child_process):
                 os.killpg(child.pid, signal.SIGKILL)
             await exited(child, 5)
         for reader in readers:
             reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
         if delivery is not None:
-            # A last pass for the final events, bounded by one agentapi call
-            # per batch; what is left waits for monitor_events.
+            # A last pass for the final events. It stops between batches after
+            # its deadline and never in the middle of a send.
             finished.set()
             with suppress(Exception):
-                await asyncio.wait_for(delivery, timeout=3 * agy.AGENTAPI_TIMEOUT)
+                await delivery
 
 
 async def _deliver(monitors: Monitors, identity: str, owner: dict, finished: asyncio.Event) -> None:
     """Notify the agy session of this monitor's events until the worker finishes.
 
-    Each batch is sent only while the owner's lifetime is confirmed to hold the
-    conversation, before the claim and again after it; otherwise the batch goes
-    back to pending, for monitor_events in the session that resumes it.
+    A batch is sent only while the owner's lifetime is confirmed to hold the
+    conversation: before the claim, and again in the sending thread right before
+    agentapi starts; otherwise the batch goes back to pending, for
+    monitor_events in the session that resumes it. The store is used from
+    threads, so that a wait for it never holds up the worker's supervision.
     """
     conversation = owner["conversation"]
 
     def confirmed() -> bool:
         return agy_alive(owner["pid"], owner["start_token"], conversation) is True
 
-    def sender(lifetime: dict) -> None:
-        monitors.update(identity, sender=lifetime)
-
-    while True:
-        last = finished.is_set()
-        retry = False
-        while confirmed() and (events := monitors.claim_monitor(identity)):
-            if not confirmed():
-                for event in events:
-                    monitors.delivered(event["id"], "pending")
-                break
+    def drain(deadline: float | None) -> bool:
+        """Send the pending batches; False to retry later."""
+        while confirmed() and (deadline is None or time.monotonic() < deadline):
+            if not (events := monitors.claim_monitor(identity)):
+                return True
             text = agy.notice(conversation, events)
-            status, detail = await asyncio.to_thread(agy.send_notice, conversation, text, sender)
-            monitors.update(identity, sender=None)
+            status, detail = agy.send_notice(conversation, text, confirmed)
             for event in events:
                 monitors.delivered(event["id"], status, detail)
             if status == "pending":
-                retry = True  # agentapi did not start; try again later
-                break
-        if last:
-            return
+                return False
+        return True
+
+    while not finished.is_set():
+        try:
+            retry = not await asyncio.to_thread(drain, None)
+        except Exception as error:  # a store error: report it and try again
+            print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
+            retry = True
         await asyncio.sleep(1 if retry else 0.2)
+    await asyncio.to_thread(drain, time.monotonic() + 2 * agy.AGENTAPI_TIMEOUT)
 
 
 if __name__ == "__main__":

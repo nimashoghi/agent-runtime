@@ -12,7 +12,6 @@ data with ``monitor_events``. No other process can message an agy session.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import subprocess
@@ -143,13 +142,18 @@ def notice(session_id: str, events: list[dict[str, Any]]) -> str:
     )
 
 
-def send_notice(
-    session_id: str, text: str, started: Callable[[dict[str, Any]], None]
-) -> tuple[str, str | None]:
-    """Send one notice with this process's agy credentials; return the delivery
-    status and a reason that holds no agentapi output (nothing promises that
-    agentapi's error text holds no credentials). started gets the lifetime of
-    the agentapi process, so that a recovery can end it if this process dies."""
+def send_notice(session_id: str, text: str, confirm: Callable[[], bool]) -> tuple[str, str | None]:
+    """Send one notice with this process's agy credentials, if confirm() still
+    holds right before agentapi starts; return the delivery status and a reason
+    that holds no agentapi output (nothing promises that agentapi's error text
+    holds no credentials).
+
+    agentapi is the agy executable with the session's own token, which every
+    command of the session already has; if this process dies while it runs, it
+    ends when agy's local server answers its one request.
+    """
+    if not confirm():
+        return "pending", None  # not started: for the session that owns them next
     try:
         child = subprocess.Popen(
             [os.environ["ANTIGRAVITY_AGENTAPI_EXE"], "agentapi", "send-message", session_id, text],
@@ -160,8 +164,6 @@ def send_notice(
     except (OSError, KeyError) as error:
         # agentapi did not start, so nothing reached the session: retry later.
         return "pending", f"agentapi did not start ({type(error).__name__})"
-    with contextlib.suppress(psutil.Error, OSError):  # it may have ended already
-        started({"pid": child.pid, "start_token": start_token(psutil.Process(child.pid))})
     try:
         status = child.wait(timeout=AGENTAPI_TIMEOUT)
     except subprocess.TimeoutExpired:
