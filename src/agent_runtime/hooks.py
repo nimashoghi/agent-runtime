@@ -8,6 +8,7 @@ import psutil
 from filelock import FileLock
 from typed_agent_hooks import shared
 
+from agent_runtime import agy
 from agent_runtime.claude import process_alive
 from agent_runtime.sessions import Registry, own_claude_registration
 
@@ -27,6 +28,11 @@ def register(
         registry.update(
             "codex", context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
         )
+        return
+    if context.host == "agy":
+        # agy hooks lack the session's message credentials, so the bridge
+        # starts from the agent's own commands (agent_runtime.agy).
+        agy.register(context.session_id, context.cwd, registry=registry)
         return
     with FileLock(str(registry.store.root / f"bridge-start-{context.session_id}.lock"), timeout=5):
         record = own_claude_registration(

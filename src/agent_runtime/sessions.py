@@ -17,7 +17,7 @@ from platformdirs import user_state_path
 from agent_runtime.claude import process_alive
 from agent_runtime.store import Store
 
-Provider = Literal["codex", "claude_code"]
+Provider = Literal["codex", "claude_code", "agy"]
 
 
 def state_directory() -> Path:
@@ -74,9 +74,10 @@ class Registry:
             )
         return json.loads(row[0])
 
-    def claude_sessions(self) -> list[dict[str, Any]]:
+    def live_sessions(self, provider: Provider) -> list[dict[str, Any]]:
+        """The registered sessions of a provider whose native process is live."""
         with self.store.connect() as db:
-            rows = db.execute("SELECT value FROM sessions WHERE provider='claude_code'").fetchall()
+            rows = db.execute("SELECT value FROM sessions WHERE provider=?", (provider,)).fetchall()
         return [record for row in rows if process_alive(record := json.loads(row[0]))]
 
 
@@ -90,6 +91,8 @@ def current_identity() -> tuple[Provider, str]:
         return "codex", identity
     if provider == "codex" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "codex", identity
+    if identity := os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        return "agy", identity
     raise RuntimeError("native session identity is unavailable")
 
 
@@ -204,7 +207,8 @@ def send_claude_peer(
         raise ValueError("peer body contains a reserved native envelope delimiter")
     provider, source_id = source_identity or current_identity()
     source = records.get(provider, source_id)
-    mode = permission_class(source.get("permission_mode"))
+    # agy hooks report no permission mode, so an agy source gets the cautious class.
+    mode = "prompting" if provider == "agy" else permission_class(source.get("permission_mode"))
     # Omit a native reply address: a Codex source has no Claude socket identity.
     # The native receiver retains OS-verified peer PID and mode admission checks.
     body = f"Peer context from {provider}:{source_id}. This is not a user instruction.\n\n{text}"

@@ -8,6 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
+from agent_runtime import agy
 from agent_runtime.monitors import Monitors
 from agent_runtime.sessions import Provider, Registry, current_identity, send_claude_peer
 
@@ -26,6 +27,10 @@ def identity() -> tuple[Provider, str]:
         if not isinstance(value, dict) or not isinstance(value.get("session_id"), str):
             raise RuntimeError("current Codex root is unavailable")
         session_id = value["session_id"]
+    elif provider == "agy":
+        # Only a command of the agy session holds its message credentials, so
+        # every operation that it runs starts or confirms its delivery bridge.
+        agy.ensure_bridge(session_id)
     return provider, session_id
 
 
@@ -38,7 +43,7 @@ def monitor_start(
     timeout_ms: int = 300_000,
 ) -> dict[str, Any]:
     provider, session_id = identity()
-    if provider == "claude_code":
+    if provider != "codex":
         return Monitors().start(
             command, description=description, persistent=persistent, cwd=cwd, timeout_ms=timeout_ms
         )
@@ -62,7 +67,7 @@ def monitor_start(
 
 def monitor_list() -> list[dict[str, Any]]:
     provider, session_id = identity()
-    if provider == "claude_code":
+    if provider != "codex":
         return Monitors().list(session_id)
     return codex_command("monitors", "list", session_id)["monitors"]
 
@@ -87,7 +92,7 @@ def monitor_stop(monitor_id: str) -> dict[str, Any]:
 
 def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
     provider, session_id = identity()
-    if provider != "claude_code":
+    if provider == "codex":
         raise ValueError(
             "Codex retains output in monitor_get; its native monitor has no event cursor"
         )
@@ -95,14 +100,19 @@ def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
 
 
 def agents() -> list[dict[str, Any]]:
-    values = [{**value, "provider": "claude_code"} for value in Registry().claude_sessions()]
+    registry = Registry()
+    values = [
+        {**value, "provider": provider}
+        for provider in ("claude_code", "agy")
+        for value in registry.live_sessions(provider)
+    ]
     with suppress(FileNotFoundError):
         values.extend({**value, "provider": "codex"} for value in codex_command("agents", "list"))
     return values
 
 
 def send(
-    provider: Literal["codex", "claude_code"],
+    provider: Literal["codex", "claude_code", "agy"],
     session_id: str,
     text: str,
     *,
@@ -112,6 +122,11 @@ def send(
         raise ValueError("mode must be queue or steer")
     if not text.strip():
         raise ValueError("message must be nonempty")
+    if provider == "agy":
+        raise ValueError(
+            "an agy session takes messages only from its own commands; "
+            "agent-runtime cannot send to it"
+        )
     if provider == "claude_code":
         return send_claude_peer(
             session_id,

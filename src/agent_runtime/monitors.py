@@ -83,20 +83,23 @@ class Monitors:
         timeout_ms: int = 300_000,
     ) -> dict[str, Any]:
         provider, session_id = current_identity()
-        if provider != "claude_code":
+        if provider == "codex":
             raise ValueError("use the Codex monitor adapter for a Codex session")
         target = self.registry.get(provider, session_id)
         if not process_alive(target):
-            raise RuntimeError("current Claude process is not live")
+            raise RuntimeError("current native process is not live")
         bridge = target.get("bridge")
         if (
             not isinstance(bridge, dict)
             or not process_alive(bridge)
             or bridge.get("native_pid") != target["pid"]
         ):
-            raise RuntimeError(
-                "the native monitor delivery bridge is not running; check agent-runtime hooks"
+            start = (
+                "check agent-runtime hooks"
+                if provider == "claude_code"
+                else "start agy monitors through agent_runtime.operations"
             )
+            raise RuntimeError(f"the native monitor delivery bridge is not running; {start}")
         if not command.strip() or not description.strip():
             raise ValueError("command and description must be nonempty")
         if isinstance(timeout_ms, bool) or timeout_ms <= 0 or not math.isfinite(timeout_ms):
@@ -115,7 +118,10 @@ class Monitors:
             "persistent": persistent,
             "status": "starting",
             "created_at": time.time(),
-            "permission_class": permission_class(target.get("permission_mode")),
+            # agy hooks report no permission mode, so agy monitors get the cautious class.
+            "permission_class": "prompting"
+            if provider == "agy"
+            else permission_class(target.get("permission_mode")),
             "owner": {"pid": target["pid"], "process_created_at": target["process_created_at"]},
         }
         with self.store.connect() as db:
@@ -123,7 +129,13 @@ class Monitors:
                 "INSERT INTO monitors VALUES(?,?,?)", (identity, session_id, json.dumps(value))
             )
         environment = os.environ.copy()
-        for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
+        # The monitored command must not hold the session's message credentials.
+        for name in (
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "ANTIGRAVITY_LS_ADDRESS",
+            "ANTIGRAVITY_CSRF_TOKEN",
+        ):
             environment.pop(name, None)
         try:
             fd = os.open(

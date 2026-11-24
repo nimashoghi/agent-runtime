@@ -193,6 +193,23 @@ def test_peer_messages_do_not_use_destination_own_token(inbox, monkeypatch):
         send_claude_peer(sid, "</cross-session-message>", registry=monitors.registry)
 
 
+def test_agy_peers_are_labelled_prompting(inbox):
+    # agy hooks report no permission mode.
+    monitors, sid, frames, _, _ = inbox
+    source = str(uuid.uuid4())
+    monitors.registry.update("agy", source, cwd="/repo")
+
+    receipt = send_claude_peer(
+        sid, "peer context", registry=monitors.registry, source_identity=("agy", source)
+    )
+
+    assert receipt["status"] == "transport-written"
+    wait_for(lambda: frames)
+    content = frames[0][0]["message"]["content"]
+    assert 'from-mode="prompting"' in content
+    assert f"Peer context from agy:{source}" in content
+
+
 def test_excessive_output_stops_with_inspectable_error(inbox):
     monitors, _sid, _, _, _ = inbox
     monitor = monitors.start(
