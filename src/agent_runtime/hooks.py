@@ -9,6 +9,7 @@ from filelock import FileLock
 from typed_agent_hooks import shared
 
 from agent_runtime import agy
+from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.sessions import Registry, own_claude_registration
 
@@ -55,6 +56,7 @@ def register(
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=output,
+                env=without_agy(dict(os.environ)),
                 start_new_session=True,
             )
         registry.update(

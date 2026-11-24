@@ -3,9 +3,10 @@
 ## 0.3.0
 
 - agy (Antigravity CLI) sessions, provider `"agy"`. The hooks accept the host argument `agy` (typed-agent-hooks 0.4) and record an agy conversation with its agy process. Monitors that a command of an agy session starts reach that session: a delivery bridge, which the session's first operation starts with its inherited credentials, wakes it with `agentapi send-message` and a notice of the waiting events, which the agent reads with `monitor_events`. agy sessions appear in `agents()`, and an agy session can send peer context to Claude Code sessions (with the `prompting` class, because agy reports no permission mode) and to Codex sessions. `send("agy", ...)` raises: no other process can message an agy session. The README section on agy gives the limits.
-- Monitors of a provider other than Claude Code are stored under `<provider>:<session ID>`, so that equal session IDs of two hosts never share monitors. Claude Code monitors keep the bare session ID.
-- The monitored command, a Claude worker and `codexr` do not inherit an agy session's identity or credentials.
-- `current_identity()` raises for an environment that has an agy conversation and a Claude or Codex session, instead of choosing one.
+- agy monitors are stored under `agy:<session ID>`, so that a Claude Code and an agy session with the same ID never share monitors. Claude Code monitors keep the bare session ID; Codex monitors stay in codexr.
+- The monitored command, a Claude worker, the Claude delivery child and `codexr` do not inherit an agy session's identity or credentials.
+- `current_identity()` raises `AmbiguousIdentity` for an environment that has an agy conversation and a Claude, Codex or managed session, and `IdentityUnavailable` when there is none; both are `RuntimeError`s.
+- `monitor_get` and `monitor_stop` reject another session's monitor before they read its state.
 - `Registry.live_sessions(provider)` lists the live sessions of Claude Code or agy; `Registry.claude_sessions()` remains.
 - An interrupted delivery records "delivery bridge exited during a delivery attempt".
 - Requires `typed-agent-hooks>=0.4,<0.5`.

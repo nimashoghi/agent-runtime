@@ -8,12 +8,17 @@ It wakes its own conversation with ``agentapi send-message``, which agy adds as
 a system message: so the message only says which monitor events wait, and the
 agent reads their output as data with ``monitor_events``. No other process can
 message an agy session.
+
+The live agy process of a conversation keeps the conversation's presence lock
+file open. That identifies the process without its name (macOS names a process
+after the target of the link that started it) and without its start time (which
+a step of the system clock moves on Linux).
 """
 
 from __future__ import annotations
 
-import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -29,35 +34,48 @@ from agent_runtime.monitors import Monitors, owner_key
 from agent_runtime.sessions import Registry
 
 AGENTAPI_TIMEOUT = 20  # seconds; a bridge that takes over waits longer for the lock
+CONVERSATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
+
+
+def _checked(session_id: str) -> str:
+    """The conversation ID, which names files, or ValueError."""
+    if not CONVERSATION.fullmatch(session_id):
+        raise ValueError(f"not an agy conversation ID: {session_id!r}")
+    return session_id
+
+
+def _presence_lock(session_id: str) -> Path:
+    path = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{_checked(session_id)}.lock"
+    return path.resolve()
+
+
+def _holds(process: psutil.Process, lock: Path) -> bool:
+    return any(Path(file.path).resolve() == lock for file in process.open_files())
 
 
 def native_process(session_id: str) -> psutil.Process:
-    """The agy process of a conversation, among the ancestors of this process.
-
-    The live agy process of a conversation keeps the conversation's presence
-    lock file open. A process name would not do: macOS names a process after
-    the target of the link that started it.
-    """
-    lock = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{session_id}.lock"
-    lock = lock.resolve()
+    """The agy process of a conversation, among the ancestors of this process."""
+    lock = _presence_lock(session_id)
     hidden = []
-    process = psutil.Process().parent()
-    while process is not None:
+    child = psutil.Process()
+    # Parent by parent, without psutil's parent(), which lists every process.
+    while (parent_pid := child.ppid()) > 0:
         try:
-            files = process.open_files()
-        except psutil.AccessDenied:
-            hidden.append(process.pid)
+            parent = psutil.Process(parent_pid)
         except psutil.NoSuchProcess:
             break
-        else:
-            if any(Path(file.path).resolve() == lock for file in files):
-                if process.uids().real != os.getuid():
+        try:
+            if parent.create_time() > child.create_time():
+                break  # the parent exited and its PID was reused
+            if _holds(parent, lock):
+                if parent.uids().real != os.getuid():
                     raise RuntimeError("native agy process belongs to a different user")
-                return process
-        try:
-            process = process.parent()
+                return parent
+        except psutil.AccessDenied:
+            hidden.append(parent_pid)
         except psutil.NoSuchProcess:
             break
+        child = parent
     unreadable = f"; could not read the open files of {hidden}" if hidden else ""
     raise RuntimeError(
         f"no ancestor of this process is the agy process of {session_id}{unreadable}"
@@ -72,16 +90,12 @@ def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> 
     )
 
 
-def _same_process(value: dict[str, Any], pid: int, created_at: float) -> bool:
-    started = value.get("process_created_at")
-    return (
-        value.get("pid") == pid and isinstance(started, float) and abs(started - created_at) < 0.01
-    )
-
-
 def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> dict[str, Any]:
-    """Start the session's delivery bridge unless it runs, from the agent's own command."""
-    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != session_id:
+    """Start the session's delivery bridge unless it runs, from the agent's own command.
+
+    Returns the session's record, whose pid is the verified agy process.
+    """
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != _checked(session_id):
         raise RuntimeError("the agy bridge requires the exact inherited conversation ID")
     if missing := [name for name in AGY_CREDENTIALS if not os.environ.get(name)]:
         raise RuntimeError(
@@ -89,31 +103,19 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> dict[
             "run this from a command of the agy session"
         )
     registry = registry or Registry()
-    process = native_process(session_id)
-    pid, created_at = process.pid, process.create_time()
+    pid = native_process(session_id).pid
     with FileLock(str(registry.store.root / f"bridge-start-agy-{session_id}.lock"), timeout=5):
         record = registry.get("agy", session_id)
         # The hooks register the agy process that runs this command (its
         # PreToolUse hook runs before the command); the bridge must deliver with
         # that process's credentials, and the monitors must default to its cwd.
-        if not _same_process(record, pid, created_at):
+        if record.get("pid") != pid:
             raise RuntimeError(
                 "agent-runtime hooks have not registered this agy process; "
                 "check that .agents/hooks.json runs the agent-runtime hook on PreToolUse"
             )
         bridge = record.get("bridge")
-        if (
-            isinstance(bridge, dict)
-            and process_alive(bridge)
-            and _same_process(
-                {
-                    "pid": bridge.get("native_pid"),
-                    "process_created_at": bridge.get("native_created_at"),
-                },
-                pid,
-                created_at,
-            )
-        ):
+        if isinstance(bridge, dict) and process_alive(bridge) and bridge.get("native_pid") == pid:
             return record
         root = registry.store.root
         fd = os.open(
@@ -123,15 +125,14 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> dict[
             child = subprocess.Popen(
                 [
                     sys.executable,
-                    # The bridge holds the session's token; the agent's folders
-                    # must not be on its import path.
-                    "-P",
+                    # The bridge holds the session's token: no PYTHON* variable,
+                    # user site or working folder may choose the code it runs.
+                    "-I",
                     "-m",
                     "agent_runtime.agy",
                     str(root),
                     session_id,
                     str(pid),
-                    repr(created_at),
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=output,
@@ -146,7 +147,6 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> dict[
                 "pid": child.pid,
                 "process_created_at": psutil.Process(child.pid).create_time(),
                 "native_pid": pid,
-                "native_created_at": created_at,
             },
         )
 
@@ -161,37 +161,55 @@ def _notice(session_id: str, events: list[dict[str, Any]]) -> str:
     )
 
 
-def _failure(result: subprocess.CompletedProcess[str]) -> str:
-    """Why agentapi failed, without anything that could hold the session's token."""
-    reason = f"agentapi exited with status {result.returncode}"
+def _send(executable: str, session_id: str, notice: str) -> tuple[str, str | None]:
+    """Send one notice; return the delivery status and a credential-free reason."""
     try:
-        error = json.loads(result.stdout).get("error")
-    except (ValueError, AttributeError):
-        return reason
-    token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
-    if isinstance(error, str) and error and not (token and token in error):
-        reason += f": {error[:200]}"
-    return reason
+        child = subprocess.Popen(
+            [executable, "agentapi", "send-message", session_id, notice],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        # agentapi did not start, so nothing reached the session: retry.
+        return "pending", f"agentapi did not start ({type(error).__name__})"
+    try:
+        status = child.wait(timeout=AGENTAPI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+        return "uncertain", f"agentapi did not finish in {AGENTAPI_TIMEOUT} s"
+    # A zero exit means that agy's local server took the notice, not that the
+    # model read it. agentapi's error text is not kept: nothing promises that it
+    # holds no credentials.
+    if status == 0:
+        return "transport-written", None
+    return "uncertain", f"agentapi exited with status {status}"
 
 
-def run(directory: Path, session_id: str, native_pid: int, native_created_at: float) -> None:
-    """Deliver the session's monitor observations while its agy process lives."""
-    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != session_id:
+def run(directory: Path, session_id: str, native_pid: int) -> None:
+    """Deliver the session's monitor observations while its agy process holds it."""
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != _checked(session_id):
         raise RuntimeError("the agy bridge requires the exact inherited conversation ID")
     executable = os.environ["ANTIGRAVITY_AGENTAPI_EXE"]
-    owner = {"pid": native_pid, "process_created_at": native_created_at}
+    lock = _presence_lock(session_id)
     monitors = Monitors(directory)
     key = owner_key("agy", session_id)
+    owner = ("agy", session_id, native_pid)
 
     def owns() -> bool:
-        record = monitors.registry.get("agy", session_id)
-        return process_alive(owner) and _same_process(record, native_pid, native_created_at)
+        if monitors.registry.get("agy", session_id).get("pid") != native_pid:
+            return False  # another agy process registered the conversation
+        try:
+            return _holds(psutil.Process(native_pid), lock)
+        except psutil.NoSuchProcess:
+            return False
 
     # An earlier bridge may still finish one agentapi call before it sees that
     # its agy process is gone.
     with FileLock(str(directory / f"bridge-agy-{session_id}.lock"), timeout=3 * AGENTAPI_TIMEOUT):
         if not owns():
-            return  # another agy process registered the conversation since
+            return
         process = psutil.Process()
         monitors.registry.update(
             "agy",
@@ -200,50 +218,21 @@ def run(directory: Path, session_id: str, native_pid: int, native_created_at: fl
                 "pid": process.pid,
                 "process_created_at": process.create_time(),
                 "native_pid": native_pid,
-                "native_created_at": native_created_at,
             },
         )
         monitors.interrupted_delivery(key)
         while owns():
-            if not (events := monitors.claim(key)):
+            # The claim checks the owner in its own transaction, so a bridge whose
+            # process was replaced meanwhile claims nothing.
+            if not (events := monitors.claim(key, owner=owner)):
                 time.sleep(0.2)
                 continue
-            try:
-                result = subprocess.run(
-                    [
-                        executable,
-                        "agentapi",
-                        "send-message",
-                        session_id,
-                        _notice(session_id, events),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=AGENTAPI_TIMEOUT,
-                )
-            except OSError as error:
-                # agentapi did not start, so nothing reached the session: retry.
-                for event in events:
-                    monitors.delivered(event["id"], "pending", f"agentapi did not start: {error}")
-                time.sleep(1)
-                continue
-            except subprocess.TimeoutExpired:
-                status, detail = "uncertain", f"agentapi did not finish in {AGENTAPI_TIMEOUT} s"
-            else:
-                # A zero exit means that agy's local server took the message, not
-                # that the model read it.
-                status, detail = (
-                    ("transport-written", None)
-                    if result.returncode == 0
-                    else ("uncertain", _failure(result))
-                )
+            status, detail = _send(executable, session_id, _notice(session_id, events))
             for event in events:
                 monitors.delivered(event["id"], status, detail)
-            time.sleep(0.2)
+            time.sleep(1 if status == "pending" else 0.2)
 
 
 if __name__ == "__main__":
     os.umask(0o077)
-    run(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), float(sys.argv[4]))
+    run(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]))

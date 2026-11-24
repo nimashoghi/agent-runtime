@@ -12,7 +12,13 @@ from typing import Any, Literal
 from agent_runtime import agy
 from agent_runtime.authority import without_agy
 from agent_runtime.monitors import Monitors, owner_key
-from agent_runtime.sessions import Provider, Registry, current_identity, send_claude_peer
+from agent_runtime.sessions import (
+    IdentityUnavailable,
+    Provider,
+    Registry,
+    current_identity,
+    send_claude_peer,
+)
 
 
 def codex_command(*arguments: str) -> Any:
@@ -29,17 +35,22 @@ def codex_command(*arguments: str) -> Any:
 
 
 def identity() -> tuple[Provider, str]:
+    return _identity()[:2]
+
+
+def _identity() -> tuple[Provider, str, int | None]:
+    """The current session, and for agy the agy process that its bridge serves."""
     provider, session_id = current_identity()
     if provider == "codex":
         value = codex_command("agents", "whoami")
         if not isinstance(value, dict) or not isinstance(value.get("session_id"), str):
             raise RuntimeError("current Codex root is unavailable")
-        session_id = value["session_id"]
-    elif provider == "agy":
+        return provider, value["session_id"], None
+    if provider == "agy":
         # Only a command of the agy session holds its message credentials, so
         # every operation that it runs starts or confirms its delivery bridge.
-        agy.ensure_bridge(session_id)
-    return provider, session_id
+        return provider, session_id, agy.ensure_bridge(session_id)["pid"]
+    return provider, session_id, None
 
 
 def monitor_start(
@@ -50,10 +61,15 @@ def monitor_start(
     cwd: Path | None = None,
     timeout_ms: int = 300_000,
 ) -> dict[str, Any]:
-    provider, session_id = identity()
+    provider, session_id, native_pid = _identity()
     if provider != "codex":
         return Monitors().start(
-            command, description=description, persistent=persistent, cwd=cwd, timeout_ms=timeout_ms
+            command,
+            description=description,
+            persistent=persistent,
+            cwd=cwd,
+            timeout_ms=timeout_ms,
+            owner_pid=native_pid,
         )
     arguments = [
         "monitors",
@@ -84,10 +100,11 @@ def monitor_get(monitor_id: str) -> dict[str, Any]:
     provider, session_id = identity()
     if provider == "codex":
         return codex_command("monitors", "get", session_id, monitor_id)
-    value = Monitors().get(monitor_id)
-    if value["session_id"] != owner_key(provider, session_id):
+    monitors = Monitors()
+    # Check the owner before get(), which can record a gone worker's state.
+    if monitors.session_of(monitor_id) not in (None, owner_key(provider, session_id)):
         raise ValueError("monitor belongs to another session")
-    return value
+    return monitors.get(monitor_id)
 
 
 def monitor_stop(monitor_id: str) -> dict[str, Any]:
@@ -110,7 +127,7 @@ def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
 def agents() -> list[dict[str, Any]]:
     try:
         provider, session_id = current_identity()
-    except RuntimeError:  # discovery also works from an ordinary shell
+    except IdentityUnavailable:  # discovery also works from an ordinary shell
         provider, session_id = None, ""
     if provider == "agy":
         # The first operation of a resumed agy session restarts its delivery.

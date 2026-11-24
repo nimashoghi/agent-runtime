@@ -87,29 +87,36 @@ class Registry:
         return self.live_sessions("claude_code")
 
 
+class IdentityUnavailable(RuntimeError):
+    """The environment names no native session."""
+
+
+class AmbiguousIdentity(RuntimeError):
+    """The environment names an agy conversation and another session."""
+
+
 def current_identity() -> tuple[Provider, str]:
+    # A command inherits the identity of every session around it, and which of an
+    # agy conversation and another session is the nearer one cannot be told from
+    # the environment. So agy comes first, and refuses to share.
+    if agy_id := os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        others = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "AGENT_SESSION_ID")
+        if any(os.environ.get(name) for name in others):
+            raise AmbiguousIdentity(
+                "ambiguous native identity: an agy conversation and another session; "
+                "start the session without the other's environment"
+            )
+        return "agy", agy_id
     provider = os.environ.get("AGENT_SESSION_PROVIDER")
     if provider == "claude_code" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "claude_code", identity
-    # A command inherits the identity of every session around it. Which of an agy
-    # conversation and a Claude or Codex session is the nearer one cannot be told
-    # from the environment, so refuse to guess.
-    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") and (
-        os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
-    ):
-        raise RuntimeError(
-            "ambiguous native identity: an agy conversation and a Claude or Codex session; "
-            "start the session without the other's environment"
-        )
     if identity := os.environ.get("CLAUDE_CODE_SESSION_ID"):
         return "claude_code", identity
     if identity := os.environ.get("CODEX_THREAD_ID"):
         return "codex", identity
     if provider == "codex" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "codex", identity
-    if identity := os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
-        return "agy", identity
-    raise RuntimeError("native session identity is unavailable")
+    raise IdentityUnavailable("native session identity is unavailable")
 
 
 def permission_class(mode: str | None) -> Literal["bypass", "prompting"]:

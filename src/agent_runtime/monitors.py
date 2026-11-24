@@ -14,7 +14,7 @@ from typing import Any
 
 import psutil
 
-from agent_runtime.authority import AGY_CREDENTIALS
+from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.sessions import Provider, Registry, current_identity, permission_class
 
@@ -75,6 +75,12 @@ class Monitors:
             db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
         return value
 
+    def session_of(self, monitor_id: str) -> str | None:
+        """The session column of a monitor, read without reconciling its state."""
+        with self.store.connect() as db:
+            row = db.execute("SELECT session_id FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+        return row[0] if row else None
+
     def list(self, session_id: str) -> list[dict[str, Any]]:
         with self.store.connect() as db:
             ids = [
@@ -91,7 +97,11 @@ class Monitors:
         persistent: bool = False,
         cwd: Path | None = None,
         timeout_ms: int = 300_000,
+        owner_pid: int | None = None,
     ) -> dict[str, Any]:
+        """Start a monitor for the current native session. owner_pid, when given,
+        is the native process that the caller verified; the monitor is created
+        only while the session's record still names it."""
         provider, session_id = current_identity()
         if provider == "codex":
             raise ValueError("use the Codex monitor adapter for a Codex session")
@@ -136,14 +146,18 @@ class Monitors:
             "owner": {"pid": target["pid"], "process_created_at": target["process_created_at"]},
         }
         with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if owner_pid is not None:
+                row = db.execute(
+                    "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, session_id)
+                ).fetchone()
+                if row is None or json.loads(row[0]).get("pid") != owner_pid:
+                    raise RuntimeError("the session moved to another native process")
             db.execute("INSERT INTO monitors VALUES(?,?,?)", (identity, key, json.dumps(value)))
-        environment = os.environ.copy()
-        # The monitored command must not hold the session's message credentials.
-        for name in (
-            "CLAUDE_CODE_MESSAGING_TOKEN",
-            "CLAUDE_CODE_MESSAGING_SOCKET",
-            *AGY_CREDENTIALS,
-        ):
+        # The monitored command is not the session: it gets neither its message
+        # credentials nor an agy session's identity.
+        environment = without_agy(dict(os.environ))
+        for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
             environment.pop(name, None)
         try:
             fd = os.open(
@@ -202,9 +216,21 @@ class Monitors:
                 )
             ]
 
-    def claim(self, session_id: str) -> list[dict[str, Any]]:
+    def claim(
+        self, session_id: str, *, owner: tuple[Provider, str, int] | None = None
+    ) -> list[dict[str, Any]]:
+        """Mark up to 32 pending events dispatching and return them. With owner
+        (provider, native session ID, PID), claim nothing unless the session's
+        record still names that process, in the same transaction."""
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if owner is not None:
+                provider, native_id, pid = owner
+                row = db.execute(
+                    "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, native_id)
+                ).fetchone()
+                if row is None or json.loads(row[0]).get("pid") != pid:
+                    return []
             rows = db.execute(
                 "SELECT * FROM monitor_events WHERE session_id=? AND status='pending' "
                 "ORDER BY id LIMIT 32",
