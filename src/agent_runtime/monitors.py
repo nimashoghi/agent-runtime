@@ -9,13 +9,83 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import psutil
-
+from agent_runtime import agy
+from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
-from agent_runtime.sessions import Registry, current_identity, permission_class
+from agent_runtime.processes import boot_id, lifetime_alive
+from agent_runtime.sessions import Provider, Registry, current_identity, permission_class
+
+
+def owner_key(provider: Provider, session_id: str) -> str:
+    """The value of a monitor's session column for a native session.
+
+    Claude Code keeps the bare ID that earlier versions wrote. Other providers
+    are prefixed, so that equal session IDs of two hosts never share monitors.
+    """
+    return session_id if provider == "claude_code" else f"{provider}:{session_id}"
+
+
+DID_NOT_START = "monitor worker did not start"
+STOPPED_BEFORE_START = "stopped before its command started."
+
+
+def _end(db: Any, value: dict[str, Any], status: str, text: str | None, **fields: Any) -> None:
+    """Record a monitor's outcome, and its event "Monitor <id> <text>" when
+    there is text, in the caller's transaction; value is updated in place."""
+    value.update(status=status, **fields, updated_at=time.time())
+    db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), value["monitor_id"]))
+    if text is not None:
+        db.execute(
+            "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+            "VALUES(?,?,?,'pending',?)",
+            (
+                value["monitor_id"],
+                value["session_id"],
+                f"Monitor {value['monitor_id']} {text}",
+                time.time(),
+            ),
+        )
+
+
+def _start_mark() -> dict[str, Any]:
+    """When a monitor started, on the monotonic clock of this boot."""
+    try:
+        boot = boot_id()
+    except OSError:
+        boot = None
+    return {"boot": boot, "monotonic": time.monotonic()}
+
+
+def _start_overdue(value: dict[str, Any]) -> bool:
+    """Whether a monitor's worker had its 60 seconds to record itself.
+
+    Measured on the monotonic clock, which a step of the calendar clock does
+    not move. That clock runs per boot: another boot, known by its ID or by a
+    monotonic time before the start, means that no worker of it runs. Only a
+    record of an earlier version, which has no monotonic start, uses the
+    calendar clock.
+    """
+    if (started := value.get("started")) is None:
+        return time.time() - value["created_at"] > 60
+    try:
+        boot = boot_id()
+    except OSError:
+        boot = None
+    if boot is not None and started["boot"] is not None and boot != started["boot"]:
+        return True
+    elapsed = time.monotonic() - started["monotonic"]
+    return elapsed < 0 or elapsed > 60
+
+
+def _worker_alive(value: dict[str, Any]) -> bool:
+    """A worker that recorded its start token is judged by it, unchanged by clock steps."""
+    if token := value.get("start_token"):
+        return lifetime_alive(value["pid"], token) is not False
+    return process_alive(value)
 
 
 class Monitors:
@@ -31,6 +101,7 @@ class Monitors:
                     text TEXT, status TEXT, created REAL, error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS monitor_delivery ON monitor_events(session_id,status,id);
+                CREATE INDEX IF NOT EXISTS monitor_claims ON monitor_events(monitor_id,status,id);
             """)
 
     def get(self, monitor_id: str) -> dict[str, Any]:
@@ -42,18 +113,112 @@ class Monitors:
         if (
             value["status"] in {"running", "starting"}
             and value.get("pid")
-            and not process_alive(value)
+            and not _worker_alive(value)
         ):
-            value = self.update(monitor_id, status="interrupted", error="monitor worker exited")
+            value = self._interrupt(monitor_id, value["pid"])
         if (
-            value["status"] == "starting"
-            and not value.get("pid")
-            and time.time() - value["created_at"] > 60
+            "start_token" in value.get("owner", {})
+            and value["status"] not in {"running", "starting"}
+            and value.get("pid")
+            and not _worker_alive(value)
         ):
-            value = self.update(
-                monitor_id, status="interrupted", error="monitor worker did not start"
-            )
+            # An agy worker delivers its own events; one that died while sending
+            # (also its final notice, after the command's outcome) leaves its
+            # batch neither sent nor pending. Repeating this changes nothing.
+            self.interrupted_delivery(value["session_id"], monitor_id=monitor_id)
+        if value["status"] == "starting" and not value.get("pid") and _start_overdue(value):
+            value = self._interrupt(monitor_id, None, error=DID_NOT_START)
         return value
+
+    def _interrupt(
+        self, monitor_id: str, pid: int | None, *, error: str = "monitor worker exited"
+    ) -> dict[str, Any]:
+        """Record that the worker exited (or never started), unless it recorded
+        another lifetime or an outcome meanwhile: the record is read again, and
+        the worker checked again, inside the write transaction."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = json.loads(row[0])
+            # Without a PID, the worker never recorded itself and its time is up.
+            gone = _start_overdue(value) if pid is None else not _worker_alive(value)
+            if value["status"] in {"running", "starting"} and value.get("pid") == pid and gone:
+                if pid is None and value.get("stop_requested"):
+                    # As begin() decides: a stop request comes first.
+                    _end(db, value, "stopped", STOPPED_BEFORE_START, before_start=True)
+                else:
+                    _end(db, value, "interrupted", None, error=error)
+        return value
+
+    def _launch_failed(self, monitor_id: str, error: Exception) -> None:
+        """Record that no worker started, unless an outcome was recorded
+        meanwhile; a stop request comes first, as in begin() and get()."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            if (value := json.loads(row[0]))["status"] != "starting":
+                return
+            if value.get("stop_requested"):
+                _end(db, value, "stopped", STOPPED_BEFORE_START, before_start=True)
+            else:
+                _end(db, value, "failed", None, error=str(error))
+
+    def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
+        """Admit the worker: record its process and return the record, whose
+        status is "running", or "stopped" when a stop came before the start (the
+        worker then runs no command and delivers the stop notice). Return None
+        when the worker must exit at once.
+
+        One transaction decides, in this order of precedence, which a reader's
+        get() keeps too: a stop request, an expired startup grace ("did not
+        start"), and a worker that readers could not judge (by its start token,
+        or for a Claude monitor's worker without one, by its creation time),
+        which fails with its event.
+        """
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = json.loads(row[0])
+            judged = "start_token" in lifetime or (
+                "start_token" not in value["owner"] and "process_created_at" in lifetime
+            )
+            if value.get("before_start") and not value.get("pid") and judged:
+                # A reader recorded the stop before this worker came: it takes
+                # on the stop notice, which only a worker sends.
+                value.update(**lifetime, updated_at=time.time())
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
+                return value
+            if value["status"] != "starting":
+                return None
+            if value.get("stop_requested"):
+                fields = {**(lifetime if judged else {}), "before_start": True}
+                _end(db, value, "stopped", STOPPED_BEFORE_START, **fields)
+                return value if judged else None
+            if _start_overdue(value):
+                _end(db, value, "interrupted", None, error=DID_NOT_START)
+                return None
+            if not judged:
+                error = "the monitor worker cannot read its own process identity"
+                _end(db, value, "failed", f"failed: {error}", error=error)
+                return None
+            value.update(status="running", **lifetime, updated_at=time.time())
+            db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
+        return value
+
+    def finish(self, monitor_id: str, text: str, **fields: Any) -> None:
+        """Record the monitor's outcome and its event in one transaction."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = {**json.loads(row[0]), **fields, "updated_at": time.time()}
+            db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
+            db.execute(
+                "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+                "VALUES(?,?,?,'pending',?)",
+                (monitor_id, value["session_id"], text, time.time()),
+            )
 
     def update(self, monitor_id: str, **fields: Any) -> dict[str, Any]:
         with self.store.connect() as db:
@@ -64,6 +229,12 @@ class Monitors:
             value = {**json.loads(row[0]), **fields, "updated_at": time.time()}
             db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
         return value
+
+    def session_of(self, monitor_id: str) -> str | None:
+        """The session column of a monitor, read without reconciling its state."""
+        with self.store.connect() as db:
+            row = db.execute("SELECT session_id FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+        return row[0] if row else None
 
     def list(self, session_id: str) -> list[dict[str, Any]]:
         with self.store.connect() as db:
@@ -82,32 +253,50 @@ class Monitors:
         cwd: Path | None = None,
         timeout_ms: int = 300_000,
     ) -> dict[str, Any]:
+        """Start a monitor for the current native session.
+
+        An agy monitor must start from a command of the agy session: its worker
+        keeps that command's credentials to deliver its own observations, and
+        its owner is that command's agy process. Its cwd defaults to the
+        command's.
+        """
         provider, session_id = current_identity()
-        if provider != "claude_code":
+        if provider == "codex":
             raise ValueError("use the Codex monitor adapter for a Codex session")
-        target = self.registry.get(provider, session_id)
-        if not process_alive(target):
-            raise RuntimeError("current Claude process is not live")
-        bridge = target.get("bridge")
-        if (
-            not isinstance(bridge, dict)
-            or not process_alive(bridge)
-            or bridge.get("native_pid") != target["pid"]
-        ):
-            raise RuntimeError(
-                "the native monitor delivery bridge is not running; check agent-runtime hooks"
-            )
         if not command.strip() or not description.strip():
             raise ValueError("command and description must be nonempty")
         if isinstance(timeout_ms, bool) or timeout_ms <= 0 or not math.isfinite(timeout_ms):
             raise ValueError("timeout_ms must be positive and finite")
-        directory = (cwd or Path(target["cwd"])).resolve(strict=True)
+        if provider == "agy":
+            pid, token = agy.command_owner(session_id)
+            owner = {"pid": pid, "start_token": token, "conversation": session_id}
+            # agy hooks report no permission mode, so agy monitors get the cautious class.
+            mode = "prompting"
+            default_cwd = Path.cwd()
+        else:
+            target = self.registry.get(provider, session_id)
+            if not process_alive(target):
+                raise RuntimeError("current Claude process is not live")
+            bridge = target.get("bridge")
+            if (
+                not isinstance(bridge, dict)
+                or not process_alive(bridge)
+                or bridge.get("native_pid") != target["pid"]
+            ):
+                raise RuntimeError(
+                    "the native monitor delivery bridge is not running; check agent-runtime hooks"
+                )
+            owner = {"pid": target["pid"], "process_created_at": target["process_created_at"]}
+            mode = permission_class(target.get("permission_mode"))
+            default_cwd = Path(target["cwd"])
+        directory = (cwd or default_cwd).resolve(strict=True)
         if not directory.is_dir():
             raise ValueError("cwd must be a directory")
         identity = "m" + uuid.uuid4().hex
+        key = owner_key(provider, session_id)
         value = {
             "monitor_id": identity,
-            "session_id": session_id,
+            "session_id": key,
             "command": command,
             "description": description,
             "cwd": str(directory),
@@ -115,45 +304,56 @@ class Monitors:
             "persistent": persistent,
             "status": "starting",
             "created_at": time.time(),
-            "permission_class": permission_class(target.get("permission_mode")),
-            "owner": {"pid": target["pid"], "process_created_at": target["process_created_at"]},
+            "started": _start_mark(),
+            "permission_class": mode,
+            "owner": owner,
         }
         with self.store.connect() as db:
-            db.execute(
-                "INSERT INTO monitors VALUES(?,?,?)", (identity, session_id, json.dumps(value))
-            )
-        environment = os.environ.copy()
+            db.execute("INSERT INTO monitors VALUES(?,?,?)", (identity, key, json.dumps(value)))
+        # The worker of an agy monitor keeps the command's agy credentials and
+        # gives the monitored command none of them; a Claude monitor's worker
+        # gets neither Claude's nor agy's.
+        environment = dict(os.environ) if provider == "agy" else without_agy(dict(os.environ))
         for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
             environment.pop(name, None)
+        # The worker records its own process when it starts (Monitors.begin), so
+        # nothing here can fail after it started.
         try:
             fd = os.open(
                 self.store.root / f"{identity}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
             )
-            with os.fdopen(fd, "ab", buffering=0) as output:
-                child = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "agent_runtime.monitor_worker",
-                        str(self.store.root),
-                        identity,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=output,
-                    env=environment,
-                    start_new_session=True,
-                )
-            try:
-                created = psutil.Process(child.pid).create_time()
-            except psutil.NoSuchProcess:
-                child.wait()
-            else:
-                self.update(identity, pid=child.pid, process_created_at=created)
-        except Exception as error:
-            self.update(identity, status="failed", error=str(error))
+        except OSError as error:
+            self._launch_failed(identity, error)
             raise
-        return self.get(identity)
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    # An agy worker holds the session's token: no PYTHON*
+                    # variable, user site or working folder may choose its code.
+                    *(["-I"] if provider == "agy" else []),
+                    "-m",
+                    # agent-runtime 0.2 has no agy worker, whose command gets no credentials.
+                    "agent_runtime.agy_monitor_worker"
+                    if provider == "agy"
+                    else "agent_runtime.monitor_worker",
+                    str(self.store.root),
+                    identity,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=fd,
+                stderr=fd,
+                env=environment,
+                cwd=self.store.root if provider == "agy" else None,
+                start_new_session=True,
+            )
+        except Exception as error:  # no worker started
+            self._launch_failed(identity, error)
+            raise
+        finally:
+            with suppress(OSError):  # the worker has its own copy
+                os.close(fd)
+        return value
 
     def stop(self, monitor_id: str) -> dict[str, Any]:
         value = self.get(monitor_id)
@@ -162,6 +362,10 @@ class Monitors:
         return value
 
     def append(self, monitor_id: str, text: str) -> int:
+        """Record an observation of a monitor. Only the monitor's worker calls
+        this while the worker runs: an agy worker wakes its idle delivery when it
+        records one, and an event that another process recorded meanwhile waits
+        for the worker's next drain or for monitor_events."""
         value = self.get(monitor_id)
         with self.store.connect() as db:
             cursor = db.execute(
@@ -183,12 +387,31 @@ class Monitors:
             ]
 
     def claim(self, session_id: str) -> list[dict[str, Any]]:
+        return self._claim("session_id", session_id)
+
+    def has_pending(self, monitor_id: str) -> bool:
+        """Whether a monitor has events that wait to be sent."""
+        with self.store.connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM monitor_events WHERE monitor_id=? AND status='pending' LIMIT 1",
+                    (monitor_id,),
+                ).fetchone()
+                is not None
+            )
+
+    def claim_monitor(self, monitor_id: str) -> list[dict[str, Any]]:
+        """Claim the pending events of one monitor; its agy worker is their only claimant."""
+        return self._claim("monitor_id", monitor_id)
+
+    def _claim(self, column: str, value: str) -> list[dict[str, Any]]:
+        assert column in ("session_id", "monitor_id")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                "SELECT * FROM monitor_events WHERE session_id=? AND status='pending' "
+                f"SELECT * FROM monitor_events WHERE {column}=? AND status='pending' "
                 "ORDER BY id LIMIT 32",
-                (session_id,),
+                (value,),
             ).fetchall()
             total = 0
             selected = []
@@ -203,17 +426,51 @@ class Monitors:
             )
         return selected
 
+    def settle(self, ids: list[int], status: str, error: str | None = None) -> None:
+        """Write one batch's receipt in one transaction."""
+        with self.store.connect() as db:
+            db.executemany(
+                "UPDATE monitor_events SET status=?,error=? WHERE id=?",
+                [(status, error, identity) for identity in ids],
+            )
+
     def delivered(self, identity: int, status: str, error: str | None = None) -> None:
         with self.store.connect() as db:
             db.execute(
                 "UPDATE monitor_events SET status=?,error=? WHERE id=?", (status, error, identity)
             )
 
-    def interrupted_delivery(self, session_id: str) -> None:
+    def reconcile_deliveries(self, session_id: str) -> None:
+        """Read each monitor of the session that has a batch being sent, so that
+        the batch of a worker that died shows as uncertain."""
         with self.store.connect() as db:
+            identities = [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT monitor_id FROM monitor_events "
+                    "WHERE session_id=? AND status='dispatching'",
+                    (session_id,),
+                )
+            ]
+        for identity in identities:
+            self.get(identity)
+
+    def interrupted_delivery(self, session_id: str, *, monitor_id: str | None = None) -> None:
+        """Mark the events that a delivery that ended left dispatching uncertain."""
+        with self.store.connect() as db:
+            # A read first, so that a monitor without such events takes no write lock.
+            if (
+                db.execute(
+                    "SELECT 1 FROM monitor_events WHERE session_id=? AND status='dispatching' "
+                    "AND (? IS NULL OR monitor_id=?) LIMIT 1",
+                    (session_id, monitor_id, monitor_id),
+                ).fetchone()
+                is None
+            ):
+                return
             db.execute(
                 "UPDATE monitor_events SET status='uncertain',"
-                "error='delivery bridge exited during socket write' "
-                "WHERE session_id=? AND status='dispatching'",
-                (session_id,),
+                "error='delivery exited during a delivery attempt' "
+                "WHERE session_id=? AND status='dispatching' AND (? IS NULL OR monitor_id=?)",
+                (session_id, monitor_id, monitor_id),
             )

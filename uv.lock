@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-runtime-py"
-version = "0.2.4"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
@@ -38,8 +38,8 @@ requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = "==0.2.159" },
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
-    { name = "psutil", specifier = ">=7,<8" },
-    { name = "typed-agent-hooks", specifier = ">=0.3,<0.4" },
+    { name = "psutil", specifier = ">=7.1,<8" },
+    { name = "typed-agent-hooks", specifier = ">=0.4,<0.5" },
 ]
 provides-extras = ["claude"]
 
@@ -950,14 +950,14 @@ wheels = [
 
 [[package]]
 name = "typed-agent-hooks"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cc/0e/770d2d2cca62894fe170fc266f9b1fefbfde0e6ac03a8873a1ea5f6e33b4/typed_agent_hooks-0.3.0.tar.gz", hash = "sha256:344dd64d87b8b76044b96dae9fa4f0ad2430f1ed1597520b7394058a85e83a55", size = 16284, upload-time = "2026-10-27T20:32:39.757Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/7d/8b240f4682590e18382cb6867592a491c54b260b4f2a02af7a0a4c0fb374/typed_agent_hooks-0.4.0.tar.gz", hash = "sha256:6af6b7a6f801a0299546f54a63c393e53fd413bd7308d9c1d968eaaf682edd85", size = 23817, upload-time = "2026-11-24T19:01:47.73Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/45/b374fadf78a07adaf99649c3d054d43495dc0038593c3aafcf382397bc5f/typed_agent_hooks-0.3.0-py3-none-any.whl", hash = "sha256:b41020aafc2c913da7f362dfd7570da1fc6b9039d403e8078ea5f5ece8ae5dd2", size = 22930, upload-time = "2026-10-27T20:32:38.47Z" },
+    { url = "https://files.pythonhosted.org/packages/10/2f/bd00479b67a3342063b38aee43416970ff6ab7bbfc25840ec71bfc07f138/typed_agent_hooks-0.4.0-py3-none-any.whl", hash = "sha256:92112841346dde5f79b542e6083e2b2ba9dbc51eef2b8ed740881f70bd01e554", size = 32712, upload-time = "2026-11-24T19:01:46.402Z" },
 ]
 
 [[package]]

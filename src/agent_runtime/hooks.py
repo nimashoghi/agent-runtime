@@ -8,6 +8,8 @@ import psutil
 from filelock import FileLock
 from typed_agent_hooks import shared
 
+from agent_runtime import agy
+from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.sessions import Registry, own_claude_registration
 
@@ -27,6 +29,11 @@ def register(
         registry.update(
             "codex", context.session_id, cwd=context.cwd, permission_mode=context.permission_mode
         )
+        return
+    if context.host == "agy":
+        # Discovery only: an agy monitor's worker delivers its own notices with
+        # the credentials of the command that started it (agent_runtime.agy).
+        agy.register(context.session_id, context.cwd, registry=registry)
         return
     with FileLock(str(registry.store.root / f"bridge-start-{context.session_id}.lock"), timeout=5):
         record = own_claude_registration(
@@ -49,6 +56,7 @@ def register(
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=output,
+                env=without_agy(dict(os.environ)),
                 start_new_session=True,
             )
         registry.update(

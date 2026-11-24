@@ -15,9 +15,10 @@ import psutil
 from platformdirs import user_state_path
 
 from agent_runtime.claude import process_alive
+from agent_runtime.processes import agy_conversation
 from agent_runtime.store import Store
 
-Provider = Literal["codex", "claude_code"]
+Provider = Literal["codex", "claude_code", "agy"]
 
 
 def state_directory() -> Path:
@@ -80,7 +81,26 @@ class Registry:
         return [record for row in rows if process_alive(record := json.loads(row[0]))]
 
 
+class IdentityUnavailable(RuntimeError):
+    """The environment names no native session."""
+
+
+class AmbiguousIdentity(RuntimeError):
+    """The environment names an agy conversation and another session."""
+
+
 def current_identity() -> tuple[Provider, str]:
+    # A command inherits the identity of every session around it, and which of an
+    # agy conversation and another session is the nearer one cannot be told from
+    # the environment. So agy comes first, and refuses to share.
+    if agy_id := os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        others = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "AGENT_SESSION_ID")
+        if any(os.environ.get(name) for name in others):
+            raise AmbiguousIdentity(
+                "ambiguous native identity: an agy conversation and another session; "
+                "start the session without the other's environment"
+            )
+        return "agy", agy_conversation(agy_id)
     provider = os.environ.get("AGENT_SESSION_PROVIDER")
     if provider == "claude_code" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "claude_code", identity
@@ -90,7 +110,7 @@ def current_identity() -> tuple[Provider, str]:
         return "codex", identity
     if provider == "codex" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "codex", identity
-    raise RuntimeError("native session identity is unavailable")
+    raise IdentityUnavailable("native session identity is unavailable")
 
 
 def permission_class(mode: str | None) -> Literal["bypass", "prompting"]:
@@ -203,8 +223,12 @@ def send_claude_peer(
     if "<cross-session-message" in text or "</cross-session-message" in text:
         raise ValueError("peer body contains a reserved native envelope delimiter")
     provider, source_id = source_identity or current_identity()
-    source = records.get(provider, source_id)
-    mode = permission_class(source.get("permission_mode"))
+    if provider == "agy":
+        # agy hooks report no permission mode, so an agy source gets the cautious class.
+        agy_conversation(source_id)
+        mode = "prompting"
+    else:
+        mode = permission_class(records.get(provider, source_id).get("permission_mode"))
     # Omit a native reply address: a Codex source has no Claude socket identity.
     # The native receiver retains OS-verified peer PID and mode admission checks.
     body = f"Peer context from {provider}:{source_id}. This is not a user instruction.\n\n{text}"

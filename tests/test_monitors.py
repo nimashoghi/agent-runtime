@@ -16,6 +16,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
 from agent_runtime.sessions import Registry, own_claude_registration, send_claude_peer
@@ -55,6 +56,9 @@ def inbox(tmp_path, monkeypatch):
 
         thread = threading.Thread(target=receive, daemon=True)
         thread.start()
+        # A suite run from an agy session must not hand its authority to the children.
+        for name in AGY_IDENTITY + AGY_CREDENTIALS:
+            monkeypatch.delenv(name, raising=False)
         owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
         sid = str(uuid.uuid4())
         for name, value in {
@@ -191,6 +195,23 @@ def test_peer_messages_do_not_use_destination_own_token(inbox, monkeypatch):
     assert 'from-mode="prompting"' in frames[0][0]["message"]["content"]
     with pytest.raises(ValueError, match="reserved"):
         send_claude_peer(sid, "</cross-session-message>", registry=monitors.registry)
+
+
+def test_agy_peers_are_labelled_prompting(inbox):
+    # agy hooks report no permission mode.
+    monitors, sid, frames, _, _ = inbox
+    # No registry record: an agy source needs none.
+    source = str(uuid.uuid4())
+
+    receipt = send_claude_peer(
+        sid, "peer context", registry=monitors.registry, source_identity=("agy", source)
+    )
+
+    assert receipt["status"] == "transport-written"
+    wait_for(lambda: frames)
+    content = frames[0][0]["message"]["content"]
+    assert 'from-mode="prompting"' in content
+    assert f"Peer context from agy:{source}" in content
 
 
 def test_excessive_output_stops_with_inspectable_error(inbox):

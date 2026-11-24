@@ -15,6 +15,7 @@ from filelock import FileLock
 
 from agent_runtime import ClaudeRuntime, LaunchOptions, worker
 from agent_runtime import claude as claude_module
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 
 
 @pytest.fixture
@@ -30,6 +31,9 @@ if "--version" in sys.argv:
 if os.environ.get("FAKE_CLAUDE_ARGV"):
     with open(os.environ["FAKE_CLAUDE_ARGV"], "w") as log:
         json.dump(sys.argv, log)
+if os.environ.get("FAKE_CLAUDE_AGY"):
+    with open(os.environ["FAKE_CLAUDE_AGY"], "w") as log:
+        json.dump(sorted(name for name in os.environ if name.startswith("ANTIGRAVITY_")), log)
 if os.environ.get("FAKE_CLAUDE_FAILS"):
     for number in range(30):
         print(f"line {number} " + "x" * 600, file=sys.stderr, flush=True)
@@ -267,6 +271,38 @@ async def test_a_turn_for_another_origin_is_not_ended_by_the_idle_timeout(tmp_pa
         assert settled[1]["message"] == "peer turn done"
     finally:
         await runtime.stop(eid)
+
+
+async def test_a_worker_started_from_an_agy_command_gets_no_agy_authority(
+    tmp_path, native, monkeypatch
+):
+    for name, value in {
+        "ANTIGRAVITY_CONVERSATION_ID": "c1",
+        "ANTIGRAVITY_AGENT": "1",
+        "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+        "ANTIGRAVITY_CSRF_TOKEN": "agy-token",
+        "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
+    }.items():
+        monkeypatch.setenv(name, value)
+    opts = LaunchOptions(
+        cwd=tmp_path,
+        claude=native,
+        idle_timeout_seconds=0,
+        environment={
+            "FAKE_CLAUDE_LOG": str(tmp_path / "inputs.jsonl"),
+            "FAKE_CLAUDE_AGY": str(tmp_path / "agy.json"),
+        },
+    )
+    runtime = ClaudeRuntime(tmp_path / "runtime")
+    value = await runtime.start("hello", message_id="m1", options=opts, launch_id="agy")
+    try:
+        await wait_for(
+            lambda: runtime.store.receipt(value["session_id"], "m1")["status"] == "delivered"
+        )
+        inherited = set(json.loads((tmp_path / "agy.json").read_text()))
+        assert not inherited & {*AGY_IDENTITY, *AGY_CREDENTIALS}
+    finally:
+        await runtime.stop(value["execution_id"])
 
 
 async def test_effort_reaches_native_claude_and_a_link_to_it_is_not_resolved(tmp_path, native):

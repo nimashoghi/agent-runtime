@@ -22,6 +22,7 @@ from typing import Any
 import psutil
 from filelock import FileLock, Timeout
 
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 from agent_runtime.store import Store
 
 
@@ -228,6 +229,8 @@ class ClaudeRuntime:
                 "CODEX_THREAD_ID",
                 "CODEXR_SESSION_ROOT",
                 "AGENT_SUBAGENT_ID",
+                *AGY_IDENTITY,
+                *AGY_CREDENTIALS,
             ):
                 environment.pop(name, None)
             environment.update(AGENT_SESSION_PROVIDER="claude_code", AGENT_SESSION_ID=session_id)
