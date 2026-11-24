@@ -50,8 +50,11 @@ def native_process(session_id: str) -> Owner:
             token = start_token(parent)
         except psutil.NoSuchProcess:
             break
-        except (psutil.AccessDenied, OSError):
-            raise RuntimeError(f"cannot identify ancestor {parent_pid} of this process") from None
+        except (psutil.AccessDenied, OSError) as error:
+            # Also a boot ID that this process may not read.
+            raise RuntimeError(
+                f"cannot identify ancestor {parent_pid} of this process: {error}"
+            ) from error
         links.append((child_pid, parent_pid, token))
         try:
             held = holds(parent_pid, lock)
@@ -156,15 +159,34 @@ _INSPECTIONS_LOCK = threading.Lock()
 _MAX_INSPECTIONS = 32
 
 
+def _inspection(key: tuple[int, str, str]) -> _Inspection | None:
+    """The running inspection of an agy process, or a new one; None when too
+    many run. A thread that cannot start makes a finished, unknown inspection."""
+    with _INSPECTIONS_LOCK:
+        if (inspection := _INSPECTIONS.get(key)) is not None:
+            return inspection
+        if len(_INSPECTIONS) >= _MAX_INSPECTIONS:
+            return None
+        inspection = _INSPECTIONS[key] = _Inspection(key)
+        try:
+            # The thread removes its entry under this lock, so only after this.
+            inspection.thread.start()
+        except RuntimeError:
+            del _INSPECTIONS[key]
+            inspection.done.set()
+        return inspection
+
+
 def live_sessions(
     registry: Registry | None = None, *, timeout: float = 2.0
 ) -> list[dict[str, Any]]:
     """The registered agy sessions whose agy process still holds the conversation.
 
     Each process is inspected in a daemon thread, which a later discovery shares
-    while it runs. An inspection that has not ended by the deadline (a stalled
-    file system), or that did not start because too many run, counts as unknown
-    and leaves only its session out.
+    while it runs; at most a fixed number run, and a record waits for a free one
+    until the deadline. An inspection that has not ended by the deadline (a
+    stalled file system), or not started, counts as unknown and leaves only its
+    session out.
     """
     deadline = time.monotonic() + timeout
     with (registry or Registry()).store.connect() as db:
@@ -173,12 +195,8 @@ def live_sessions(
     inspections: list[_Inspection | None] = []
     for record in records:
         key = (record.get("pid", 0), record.get("native_start", ""), record["session_id"])
-        with _INSPECTIONS_LOCK:
-            if (inspection := _INSPECTIONS.get(key)) is None and len(
-                _INSPECTIONS
-            ) < _MAX_INSPECTIONS:
-                inspection = _INSPECTIONS[key] = _Inspection(key)
-                inspection.thread.start()
+        while (inspection := _inspection(key)) is None and time.monotonic() < deadline:
+            time.sleep(0.01)
         inspections.append(inspection)
     live = []
     for record, inspection in zip(records, inspections, strict=True):

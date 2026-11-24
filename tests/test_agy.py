@@ -9,6 +9,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -16,7 +17,9 @@ from contextlib import suppress
 import psutil
 import pytest
 
+from agent_runtime import agy as agy_module
 from agent_runtime import monitor_worker, operations, processes
+from agent_runtime import monitors as monitors_module
 from agent_runtime.hooks import app
 from agent_runtime.monitors import Monitors
 from agent_runtime.processes import holds, lifetime_alive, start_token
@@ -581,3 +584,102 @@ def test_an_agy_worker_without_a_start_token_fails_before_it_runs(tmp_path, monk
     assert (failed["status"], failed["error"]) == ("failed", reason)
     (event,) = monitors.events("agy:c1")
     assert event["text"] == f"Monitor magy failed: {reason}"
+
+
+def test_a_lock_released_before_the_answer_is_not_held(tmp_path, monkeypatch):
+    lock = tmp_path / "conversation.lock"
+    lock.touch()
+    held = lock.open()
+    named = processes._named_file
+    calls = []
+
+    def releasing(path):
+        # agy releases the lock right after its descriptor matched; the name stays.
+        calls.append(path)
+        if len(calls) == 2:
+            held.close()
+        return named(path)
+
+    monkeypatch.setattr(processes, "_named_file", releasing)
+    try:
+        assert not holds(os.getpid(), lock)
+    finally:
+        held.close()
+
+
+def test_a_monitor_stopped_before_its_worker_started_never_runs(tmp_path):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mstop",
+        "session_id": "agy:c1",
+        "status": "starting",
+        "stop_requested": True,
+        "created_at": time.time(),
+        "started": {"boot": None, "monotonic": time.monotonic()},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mstop", "agy:c1", json.dumps(record)))
+
+    assert monitors.begin("mstop", pid=os.getpid(), process_created_at=1.0, start_token="w") is None
+
+    assert monitors.get("mstop")["status"] == "stopped"
+    (event,) = monitors.events("agy:c1")
+    assert event["text"] == "Monitor mstop stopped before its command started."
+
+
+def test_a_reader_without_the_boot_id_keeps_the_monotonic_grace(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mboot",
+        "session_id": "agy:c1",
+        "status": "starting",
+        "created_at": time.time() - 90,  # a step of the calendar clock
+        "started": {"boot": "an-earlier-read", "monotonic": time.monotonic()},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mboot", "agy:c1", json.dumps(record)))
+
+    def unreadable():
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(monitors_module, "boot_id", unreadable)
+    assert monitors.get("mboot")["status"] == "starting"
+
+
+def _agy_records(registry, count):
+    with registry.store.connect() as db:
+        for index in range(count):
+            value = {
+                "provider": "agy",
+                "session_id": f"c{index}",
+                "pid": index,
+                "native_start": "t",
+            }
+            db.execute("INSERT INTO sessions VALUES('agy',?,?)", (f"c{index}", json.dumps(value)))
+
+
+def test_discovery_inspects_every_session_within_its_budget(tmp_path, monkeypatch):
+    registry = Registry(tmp_path)
+    _agy_records(registry, 40)
+
+    def slow(_pid, _token, _session_id):
+        time.sleep(0.1)
+        return True
+
+    monkeypatch.setattr(agy_module, "agy_alive", slow)
+    found = agy_module.live_sessions(registry)
+    assert sorted(record["session_id"] for record in found) == sorted(f"c{i}" for i in range(40))
+
+
+def test_a_thread_that_cannot_start_leaves_discovery_working(tmp_path, monkeypatch):
+    registry = Registry(tmp_path)
+    _agy_records(registry, 2)
+
+    def refused(_thread):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refused)
+    assert agy_module.live_sessions(registry, timeout=0.5) == []
+    assert not agy_module._INSPECTIONS

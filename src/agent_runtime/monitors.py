@@ -44,20 +44,22 @@ def _start_mark() -> dict[str, Any]:
 def _start_overdue(value: dict[str, Any]) -> bool:
     """Whether a monitor's worker had its 60 seconds to record itself.
 
-    Measured on the monotonic clock of the boot that started it, which a step
-    of the calendar clock does not move; after another boot no worker of it
-    runs. A record of an earlier version, or one without a boot ID, uses the
+    Measured on the monotonic clock, which a step of the calendar clock does
+    not move. That clock runs per boot: another boot, known by its ID or by a
+    monotonic time before the start, means that no worker of it runs. Only a
+    record of an earlier version, which has no monotonic start, uses the
     calendar clock.
     """
-    started = value.get("started") or {}
-    if started.get("boot") is not None:
-        try:
-            boot = boot_id()
-        except OSError:
-            boot = None
-        if boot is not None:
-            return boot != started["boot"] or time.monotonic() - started["monotonic"] > 60
-    return time.time() - value["created_at"] > 60
+    if (started := value.get("started")) is None:
+        return time.time() - value["created_at"] > 60
+    try:
+        boot = boot_id()
+    except OSError:
+        boot = None
+    if boot is not None and started["boot"] is not None and boot != started["boot"]:
+        return True
+    elapsed = time.monotonic() - started["monotonic"]
+    return elapsed < 0 or elapsed > 60
 
 
 def _worker_alive(value: dict[str, Any]) -> bool:
@@ -119,11 +121,9 @@ class Monitors:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
-            if (
-                value["status"] in {"running", "starting"}
-                and value.get("pid") == pid
-                and (pid is None or not _worker_alive(value))
-            ):
+            # Without a PID, the worker never recorded itself and its time is up.
+            gone = _start_overdue(value) if pid is None else not _worker_alive(value)
+            if value["status"] in {"running", "starting"} and value.get("pid") == pid and gone:
                 value.update(status="interrupted", error=error, updated_at=time.time())
                 db.execute(
                     "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
@@ -143,6 +143,23 @@ class Monitors:
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
             if value["status"] != "starting":
+                return None
+            if value.get("stop_requested"):
+                # Stopped before it started: the command never runs.
+                value.update(status="stopped", updated_at=time.time())
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
+                db.execute(
+                    "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+                    "VALUES(?,?,?,'pending',?)",
+                    (
+                        monitor_id,
+                        value["session_id"],
+                        f"Monitor {monitor_id} stopped before its command started.",
+                        time.time(),
+                    ),
+                )
                 return None
             if _start_overdue(value):
                 # Readers may already have reported this; a late worker never runs.

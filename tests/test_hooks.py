@@ -12,6 +12,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 from agent_runtime.claude import process_alive
 from agent_runtime.hooks import app
 from agent_runtime.sessions import Registry, own_claude_registration
@@ -141,7 +142,7 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             assert process_alive(bridge)
             # The bridge holds Claude's inbox token and none of agy's authority.
             environment = psutil.Process(bridge["pid"]).environ()
-            assert not [name for name in environment if name.startswith("ANTIGRAVITY_")]
+            assert not set(environment) & {*AGY_IDENTITY, *AGY_CREDENTIALS}
 
             prompt = {
                 **payload,

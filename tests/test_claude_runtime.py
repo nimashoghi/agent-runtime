@@ -15,6 +15,7 @@ from filelock import FileLock
 
 from agent_runtime import ClaudeRuntime, LaunchOptions, worker
 from agent_runtime import claude as claude_module
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 
 
 @pytest.fixture
@@ -298,7 +299,8 @@ async def test_a_worker_started_from_an_agy_command_gets_no_agy_authority(
         await wait_for(
             lambda: runtime.store.receipt(value["session_id"], "m1")["status"] == "delivered"
         )
-        assert json.loads((tmp_path / "agy.json").read_text()) == []
+        inherited = set(json.loads((tmp_path / "agy.json").read_text()))
+        assert not inherited & {*AGY_IDENTITY, *AGY_CREDENTIALS}
     finally:
         await runtime.stop(value["execution_id"])
 

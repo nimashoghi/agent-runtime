@@ -74,7 +74,7 @@ def presence_lock(session_id: str) -> Path:
 
 
 if sys.platform == "darwin":
-    # sys/proc_info.h and libproc: the descriptors of another process, and the
+    # sys/proc_info.h and libproc: the descriptors of another process and the
     # device and inode of each open file, which psutil does not give. ctypes
     # releases the GIL during each call, so a stalled file system holds up only
     # the thread that inspects.
@@ -99,23 +99,18 @@ if sys.platform == "darwin":
             ("vst_qspare", ctypes.c_int64 * 2),
         ]
 
-    class _VnodeInfoPath(ctypes.Structure):
-        _fields_ = [
-            ("vi_stat", _VinfoStat),
-            ("vi_type", ctypes.c_int),
-            ("vi_pad", ctypes.c_int),
-            ("vi_fsid", ctypes.c_int32 * 2),
-            ("vip_path", ctypes.c_char * 1024),
-        ]
-
-    class _VnodeFdInfoWithPath(ctypes.Structure):
+    class _VnodeFdInfo(ctypes.Structure):
+        # struct vnode_fdinfo: proc_fileinfo, then vnode_info.
         _fields_ = [
             ("fi_openflags", ctypes.c_uint32),
             ("fi_status", ctypes.c_uint32),
             ("fi_offset", ctypes.c_int64),
             ("fi_type", ctypes.c_int32),
             ("fi_guardflags", ctypes.c_uint32),
-            ("pvip", _VnodeInfoPath),
+            ("vi_stat", _VinfoStat),
+            ("vi_type", ctypes.c_int),
+            ("vi_pad", ctypes.c_int),
+            ("vi_fsid", ctypes.c_int32 * 2),
         ]
 
     _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -137,7 +132,8 @@ if sys.platform == "darwin":
     _LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
     _PROC_PIDLISTFDS = 1
     _PROX_FDTYPE_VNODE = 1
-    _PROC_PIDFDVNODEPATHINFO = 2
+    # Without the path, so without the path's permission check.
+    _PROC_PIDFDVNODEINFO = 1
 
     _LIBC = ctypes.CDLL(None, use_errno=True)
     _LIBC.sysctlbyname.argtypes = [
@@ -149,18 +145,44 @@ if sys.platform == "darwin":
     ]
     _LIBC.sysctlbyname.restype = ctypes.c_int
 
+    def _failed(what: str) -> OSError:
+        error = ctypes.get_errno()
+        return OSError(error, f"{what}: {os.strerror(error)}")
 
-def _failed() -> OSError:
-    error = ctypes.get_errno()
-    return OSError(error, os.strerror(error))
+    def _sysctl_text(name: bytes) -> str:
+        size = ctypes.c_size_t(128)
+        value = ctypes.create_string_buffer(size.value)
+        if _LIBC.sysctlbyname(name, value, ctypes.byref(size), None, 0) != 0:
+            raise _failed(f"sysctl {name.decode()}")
+        return value.value.decode()
 
+    def _darwin_descriptors(pid: int) -> list[int]:
+        record = ctypes.sizeof(_ProcFdInfo)
+        if (estimate := _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)) <= 0:
+            raise _failed("proc_pidinfo")
+        count = estimate // record + 32
+        for _attempt in range(4):
+            listing = (_ProcFdInfo * count)()
+            size = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, listing, ctypes.sizeof(listing))
+            if size <= 0:
+                raise _failed("proc_pidinfo")
+            if size < ctypes.sizeof(listing):  # a full buffer may have left some out
+                return [
+                    item.proc_fd
+                    for item in listing[: size // record]
+                    if item.proc_fdtype == _PROX_FDTYPE_VNODE
+                ]
+            count *= 2
+        raise OSError(errno.EAGAIN, "the descriptor table kept growing")
 
-def _sysctl_text(name: bytes) -> str:
-    size = ctypes.c_size_t(128)
-    value = ctypes.create_string_buffer(size.value)
-    if _LIBC.sysctlbyname(name, value, ctypes.byref(size), None, 0) != 0:
-        raise _failed()
-    return value.value.decode()
+    def _darwin_descriptor_file(pid: int, fd: int) -> tuple[int, int] | None:
+        info = _VnodeFdInfo()
+        size = ctypes.sizeof(info)
+        if _LIBPROC.proc_pidfdinfo(pid, fd, _PROC_PIDFDVNODEINFO, ctypes.byref(info), size) != size:
+            if ctypes.get_errno() == errno.EBADF:
+                return None
+            raise _failed("proc_pidfdinfo")
+        return info.vi_stat.vst_dev, info.vi_stat.vst_ino
 
 
 def _descriptors(pid: int) -> list[int]:
@@ -168,19 +190,7 @@ def _descriptors(pid: int) -> list[int]:
     if sys.platform.startswith("linux"):
         return [int(name) for name in os.listdir(f"/proc/{pid}/fd")]
     if sys.platform == "darwin":
-        record = ctypes.sizeof(_ProcFdInfo)
-        if (estimate := _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)) <= 0:
-            raise _failed()
-        listing = (_ProcFdInfo * (estimate // record + 32))()  # room for new descriptors
-        if (
-            size := _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, listing, ctypes.sizeof(listing))
-        ) <= 0:
-            raise _failed()
-        return [
-            item.proc_fd
-            for item in listing[: size // record]
-            if item.proc_fdtype == _PROX_FDTYPE_VNODE
-        ]
+        return _darwin_descriptors(pid)
     raise OSError(f"agy sessions need Linux or macOS, not {sys.platform}")
 
 
@@ -194,16 +204,7 @@ def _descriptor_file(pid: int, fd: int) -> tuple[int, int] | None:
             return None
         return status.st_dev, status.st_ino
     if sys.platform == "darwin":
-        info = _VnodeFdInfoWithPath()
-        size = ctypes.sizeof(info)
-        if (
-            _LIBPROC.proc_pidfdinfo(pid, fd, _PROC_PIDFDVNODEPATHINFO, ctypes.byref(info), size)
-            != size
-        ):
-            if ctypes.get_errno() == errno.EBADF:
-                return None
-            raise _failed()
-        return info.pvip.vi_stat.vst_dev, info.pvip.vi_stat.vst_ino
+        return _darwin_descriptor_file(pid, fd)
     raise OSError(f"agy sessions need Linux or macOS, not {sys.platform}")
 
 
@@ -224,15 +225,30 @@ def holds(pid: int, lock: Path) -> bool:
 
     The open file must be the same file (device and inode), so that a lock that
     agy replaced does not count for an old process that still has the old file
-    open. Raises OSError when it cannot tell, also when the name identified
-    another file after the scan than before it. Every call releases the GIL.
+    open. A descriptor that matches is checked again, with the name, right
+    before the answer, so a lock that agy released or replaced meanwhile does
+    not count. A descriptor that cannot be inspected is passed over; when no
+    other one matches, the answer is unknown. Raises OSError for unknown. Every
+    call releases the GIL.
     """
     if (named := _named_file(lock)) is None:
         return False
-    opened = {identity for fd in _descriptors(pid) if (identity := _descriptor_file(pid, fd))}
-    if _named_file(lock) != named:
-        raise OSError(errno.EAGAIN, "the presence lock changed during the scan")
-    return named in opened
+    unknown: OSError | None = None
+    for fd in _descriptors(pid):
+        try:
+            if _descriptor_file(pid, fd) != named:
+                continue
+            if _named_file(lock) != named:
+                raise OSError(errno.EAGAIN, "the presence lock changed during the scan")
+            if _descriptor_file(pid, fd) == named:
+                return True
+        except OSError as error:
+            if error.errno == errno.EAGAIN:
+                raise
+            unknown = error
+    if unknown is not None:
+        raise unknown
+    return False
 
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
