@@ -12,9 +12,8 @@ import psutil
 
 from agent_runtime import agy
 from agent_runtime.authority import without_agy
-from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import agy_alive, owner_alive, start_token
+from agent_runtime.processes import agy_alive, lifetime_alive, owner_alive, start_token
 
 
 async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -27,6 +26,20 @@ async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
     while child.returncode is None and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
     return child.returncode is not None
+
+
+def _token(pid: int) -> str | None:
+    """The start token of a process, or None when it is gone or hidden."""
+    try:
+        return start_token(psutil.Process(pid))
+    except (psutil.Error, OSError):
+        return None
+
+
+def _runs(pid: int, token: str | None) -> bool:
+    """Whether this process lifetime runs; judged by its start token, so a clock
+    step does not hide it."""
+    return token is not None and lifetime_alive(pid, token) is not False
 
 
 async def run(directory: Path, identity: str) -> None:
@@ -46,31 +59,26 @@ async def run(directory: Path, identity: str) -> None:
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
     owner = value["owner"]
-    # The worker of an agy monitor delivers its own events with the credentials
-    # of the command that started it; nothing else claims them.
-    delivering = "start_token" in owner
-
-    async def deliver() -> None:
-        if not delivering:
-            return
-        if agy_alive(owner["pid"], owner["start_token"], owner["conversation"]) is False:
-            return  # they wait for monitor_events in the session that resumes it
-        while events := monitors.claim_monitor(identity):
-            text = agy.notice(owner["conversation"], events)
-            status, detail = await asyncio.to_thread(agy.send_notice, owner["conversation"], text)
-            for event in events:
-                monitors.delivered(event["id"], status, detail)
-            if status != "transport-written":
-                return
-
-    delivered_at = 0.0
+    finished = asyncio.Event()
+    delivery = None
+    if "start_token" in owner:
+        # The worker of an agy monitor delivers its own events with the
+        # credentials of the command that started it; nothing else claims them.
+        delivery = asyncio.create_task(_deliver(monitors, identity, owner, finished))
     child = None
-    child_created = None
-    descendants = {}
+    child_token = None
+    descendants: dict[int, str | None] = {}
     started = time.monotonic()
     timed_out = False
     readers = []
     try:
+        # Stopping a command's descendants needs the process table.
+        try:
+            process.children(recursive=True)
+        except (psutil.AccessDenied, PermissionError) as error:
+            raise RuntimeError(
+                "monitors need to list the worker's child processes, which this system denies"
+            ) from error
         child = await asyncio.create_subprocess_exec(
             "/bin/bash",
             "-c",
@@ -82,8 +90,7 @@ async def run(directory: Path, identity: str) -> None:
             env=without_agy(dict(os.environ)),
             start_new_session=True,
         )
-        with suppress(psutil.NoSuchProcess):
-            child_created = psutil.Process(child.pid).create_time()
+        child_token = _token(child.pid)
 
         async def read(stream, *, observations: bool):
             buffer = b""
@@ -118,34 +125,28 @@ async def run(directory: Path, identity: str) -> None:
             asyncio.create_task(read(child.stderr, observations=False)),
         ]
         while child.returncode is None:
-            if child_created is not None:
+            if child_token is not None:
                 try:
                     for descendant in psutil.Process(child.pid).children(recursive=True):
-                        descendants[descendant.pid] = descendant.create_time()
+                        if descendant.pid not in descendants:
+                            descendants[descendant.pid] = _token(descendant.pid)
                 except psutil.NoSuchProcess:
                     pass
             state = monitors.get(identity)
             if not value["persistent"] and time.monotonic() - started >= value["timeout_ms"] / 1000:
                 timed_out = True
                 stop.set()
-            if state.get("stop_requested") or (
-                not value["persistent"] and not owner_alive(value["owner"])
-            ):
+            if state.get("stop_requested") or (not value["persistent"] and not owner_alive(owner)):
                 stop.set()
             if stop.is_set():
-                if process_alive({"pid": child.pid, "process_created_at": child_created}):
+                if _runs(child.pid, child_token):
                     os.killpg(child.pid, signal.SIGTERM)
-                    if not await exited(child, 5) and process_alive(
-                        {"pid": child.pid, "process_created_at": child_created}
-                    ):
+                    if not await exited(child, 5) and _runs(child.pid, child_token):
                         os.killpg(child.pid, signal.SIGKILL)
                 break
             for reader in readers:
                 if reader.done() and (error := reader.exception()) is not None:
                     raise error
-            if time.monotonic() - delivered_at >= 0.2:
-                await deliver()
-                delivered_at = time.monotonic()
             await asyncio.sleep(0.1)
         # Stop can win the race with a normal exit; record the exit code then too.
         await exited(child, 5)
@@ -167,25 +168,64 @@ async def run(directory: Path, identity: str) -> None:
         )
         monitors.update(identity, status=status, exit_code=child.returncode)
         monitors.append(identity, f"Monitor {identity} {status} (exit code {child.returncode}).")
-        await deliver()
     except Exception as error:
         monitors.update(identity, status="failed", error=str(error))
         monitors.append(identity, f"Monitor {identity} failed: {error}")
-        with suppress(Exception):
-            await deliver()
         raise
     finally:
-        for pid, created in descendants.items():
-            if process_alive({"pid": pid, "process_created_at": created}):
+        for pid, token in descendants.items():
+            if _runs(pid, token):
                 with suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
         if child is not None and child.returncode is None:
-            if process_alive({"pid": child.pid, "process_created_at": child_created}):
+            if _runs(child.pid, child_token):
                 os.killpg(child.pid, signal.SIGKILL)
             await exited(child, 5)
         for reader in readers:
             reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
+        if delivery is not None:
+            # A last pass for the final events, bounded by one agentapi call
+            # per batch; what is left waits for monitor_events.
+            finished.set()
+            with suppress(Exception):
+                await asyncio.wait_for(delivery, timeout=3 * agy.AGENTAPI_TIMEOUT)
+
+
+async def _deliver(monitors: Monitors, identity: str, owner: dict, finished: asyncio.Event) -> None:
+    """Notify the agy session of this monitor's events until the worker finishes.
+
+    Each batch is sent only while the owner's lifetime is confirmed to hold the
+    conversation, before the claim and again after it; otherwise the batch goes
+    back to pending, for monitor_events in the session that resumes it.
+    """
+    conversation = owner["conversation"]
+
+    def confirmed() -> bool:
+        return agy_alive(owner["pid"], owner["start_token"], conversation) is True
+
+    def sender(lifetime: dict) -> None:
+        monitors.update(identity, sender=lifetime)
+
+    while True:
+        last = finished.is_set()
+        retry = False
+        while confirmed() and (events := monitors.claim_monitor(identity)):
+            if not confirmed():
+                for event in events:
+                    monitors.delivered(event["id"], "pending")
+                break
+            text = agy.notice(conversation, events)
+            status, detail = await asyncio.to_thread(agy.send_notice, conversation, text, sender)
+            monitors.update(identity, sender=None)
+            for event in events:
+                monitors.delivered(event["id"], status, detail)
+            if status == "pending":
+                retry = True  # agentapi did not start; try again later
+                break
+        if last:
+            return
+        await asyncio.sleep(1 if retry else 0.2)
 
 
 if __name__ == "__main__":

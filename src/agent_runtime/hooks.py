@@ -31,8 +31,8 @@ def register(
         )
         return
     if context.host == "agy":
-        # agy hooks lack the session's message credentials, so the bridge
-        # starts from the agent's own commands (agent_runtime.agy).
+        # Discovery only: an agy monitor's worker delivers its own notices with
+        # the credentials of the command that started it (agent_runtime.agy).
         agy.register(context.session_id, context.cwd, registry=registry)
         return
     with FileLock(str(registry.store.root / f"bridge-start-{context.session_id}.lock"), timeout=5):

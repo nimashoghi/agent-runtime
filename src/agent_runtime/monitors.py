@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +52,7 @@ class Monitors:
                     text TEXT, status TEXT, created REAL, error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS monitor_delivery ON monitor_events(session_id,status,id);
+                CREATE INDEX IF NOT EXISTS monitor_claims ON monitor_events(monitor_id,status,id);
             """)
 
     def get(self, monitor_id: str) -> dict[str, Any]:
@@ -58,14 +61,19 @@ class Monitors:
         if row is None:
             raise KeyError("unknown monitor")
         value = json.loads(row[0])
-        if (
-            value["status"] in {"running", "starting"}
-            and value.get("pid")
-            and not _worker_alive(value)
-        ):
+        gone = bool(value.get("pid")) and not _worker_alive(value)
+        if gone and value["status"] in {"running", "starting"}:
             value = self.update(monitor_id, status="interrupted", error="monitor worker exited")
-            # An agy worker delivers its own events; one that died sending leaves
-            # them neither sent nor pending.
+        if gone and "start_token" in value.get("owner", {}):
+            # An agy worker delivers its own events. One that died while sending
+            # (also its final notice, after the command's outcome) leaves its
+            # agentapi call running with the token, and its batch neither sent
+            # nor pending. Repeating this changes nothing.
+            if isinstance(sender := value.get("sender"), dict):
+                if lifetime_alive(sender["pid"], sender["start_token"]):
+                    with suppress(ProcessLookupError):
+                        os.kill(sender["pid"], signal.SIGKILL)
+                value = self.update(monitor_id, sender=None)
             self.interrupted_delivery(value["session_id"], monitor_id=monitor_id)
         if (
             value["status"] == "starting"

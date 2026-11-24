@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
-import threading
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
@@ -18,9 +16,6 @@ from agent_runtime.sessions import Provider, Registry, current_identity, send_cl
 
 
 def codex_command(*arguments: str) -> Any:
-    # An inherited SIG_IGN would let the kernel discard codexr's exit status.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     # codexr acts for a Codex session, never with an agy command's authority.
     result = subprocess.run(
         ["codexr", *arguments],

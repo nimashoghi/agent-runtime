@@ -267,7 +267,7 @@ def test_a_persistent_monitor_keeps_its_output_for_the_resumed_session(conversat
 def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
     agy = conversation
     (agy.tmp / "agentapi.jsonl.fail").touch()
-    agy.run({"name": "start", "command": "echo one"})
+    _process, monitor = agy.run({"name": "start", "command": "echo one"})
     events = wait_for(
         lambda: (
             (found := agy.events())
@@ -276,7 +276,9 @@ def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
         )
     )
     assert all(event["error"] == "agentapi exited with status 1" for event in events)
+    # agentapi printed the token in its error; neither the store nor the log keeps it.
     assert b"fixture-token" not in (agy.state / "runtime.sqlite3").read_bytes()
+    assert b"fixture-token" not in (agy.state / f"{monitor['monitor_id']}.log").read_bytes()
 
 
 def test_an_agy_session_does_not_see_a_claude_monitor_of_the_same_id(conversation):

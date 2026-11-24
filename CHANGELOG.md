@@ -7,7 +7,7 @@
 - The monitored command, a Claude worker, the Claude delivery child and `codexr` do not inherit an agy session's identity or credentials.
 - `current_identity()` raises `AmbiguousIdentity` for an environment that has an agy conversation and a Claude, Codex or managed session, and `IdentityUnavailable` when there is none; both are `RuntimeError`s.
 - `monitor_get` and `monitor_stop` reject another session's monitor before they read its state.
-- `Monitors.claim_monitor(monitor_id)` claims one monitor's events. `agent_runtime.processes` holds a process identity that a step of the clock does not change, which the monitor worker now records and `Monitors.get` uses; the worker also resets an inherited `SIGCHLD` disposition, and so does `codexr`'s caller.
+- `Monitors.claim_monitor(monitor_id)` claims one monitor's events. `agent_runtime.processes` holds a process identity that a step of the clock does not change: the monitor worker records it for itself, its command and the command's descendants, and `Monitors.get` and the worker's stop and cleanup use it. The worker also resets an inherited `SIGCHLD` disposition, and fails at once with a reason where the system denies it the list of its child processes.
 - An interrupted delivery records "delivery exited during a delivery attempt".
 - Requires `typed-agent-hooks>=0.4,<0.5` and `psutil>=7.1,<8`.
 

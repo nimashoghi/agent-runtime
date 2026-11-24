@@ -222,9 +222,11 @@ def send_claude_peer(
     if "<cross-session-message" in text or "</cross-session-message" in text:
         raise ValueError("peer body contains a reserved native envelope delimiter")
     provider, source_id = source_identity or current_identity()
-    source = records.get(provider, source_id)
-    # agy hooks report no permission mode, so an agy source gets the cautious class.
-    mode = "prompting" if provider == "agy" else permission_class(source.get("permission_mode"))
+    if provider == "agy":
+        # agy hooks report no permission mode, so an agy source gets the cautious class.
+        mode = "prompting"
+    else:
+        mode = permission_class(records.get(provider, source_id).get("permission_mode"))
     # Omit a native reply address: a Codex source has no Claude socket identity.
     # The native receiver retains OS-verified peer PID and mode admission checks.
     body = f"Peer context from {provider}:{source_id}. This is not a user instruction.\n\n{text}"
