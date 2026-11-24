@@ -57,6 +57,8 @@ def lifetime_alive(pid: int, token: str) -> bool | None:
         # A zombie has exited, whoever's it is; this needs no boot ID.
         if process.status() == psutil.STATUS_ZOMBIE:
             return False
+        if boot is None:
+            return None  # its start cannot be compared without the boot
         return start_token(process, boot) == token and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False

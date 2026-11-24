@@ -876,12 +876,36 @@ def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
             with pytest.raises(RuntimeError, match="was not found"):
                 agy_module.command_owner("c2")
         assert len(agy_module._LOOKUPS) == 1
-        # A forked child has none of the parent's lookups, whose threads it lacks.
-        with warnings.catch_warnings():
+        # A child forked while both registry locks are held, and a lookup runs,
+        # finds its own agy process and inspects one without them.
+        with (
+            agy_module._LOOKUPS_LOCK,
+            agy_module._INSPECTIONS_LOCK,
+            warnings.catch_warnings(),
+        ):
             warnings.simplefilter("ignore", DeprecationWarning)  # fork of a threaded process
             if (child := os.fork()) == 0:
-                os._exit(0 if not agy_module._LOOKUPS else 1)
-        assert os.waitpid(child, 0)[1] == 0
+                try:
+                    agy_module.native_process = lambda _session_id: (1, "t")
+                    agy_module.agy_alive = lambda *_: True
+                    found = agy_module.command_owner("c2") == (1, "t")
+                    inspection = agy_module._inspection((1, "t", "c9"))
+                    inspected = (
+                        inspection is not None
+                        and inspection.done.wait(2)
+                        and inspection.result is True
+                    )
+                    os._exit(0 if found and inspected else 1)
+                except BaseException:
+                    os._exit(2)
+        deadline = time.monotonic() + 10
+        while (ended := os.waitpid(child, os.WNOHANG))[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if ended[0] == 0:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+            pytest.fail("the forked child waited for a lock of its parent")
+        assert os.waitstatus_to_exitcode(ended[1]) == 0
     finally:
         release.set()
     wait_for(lambda: not agy_module._LOOKUPS)
@@ -899,7 +923,7 @@ def test_a_lookup_whose_thread_cannot_start_leaves_no_slot(monkeypatch):
     start = threading.Thread.start
 
     def refused(_thread):
-        raise RuntimeError("can't start new thread")
+        raise PermissionError("an audit hook refused the thread")
 
     monkeypatch.setattr(threading.Thread, "start", refused)
     with pytest.raises(RuntimeError, match="cannot search"):
@@ -969,3 +993,51 @@ def test_a_thread_that_cannot_start_leaves_discovery_working(tmp_path, monkeypat
     monkeypatch.setattr(threading.Thread, "start", refused)
     assert agy_module.live_sessions(registry, timeout=0.5) == []
     assert not agy_module._INSPECTIONS
+
+
+def _delivery_record(monitors, monitor_id):
+    record = {
+        "monitor_id": monitor_id,
+        "session_id": "agy:c1",
+        "status": "running",
+        "created_at": time.time(),
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", (monitor_id, "agy:c1", json.dumps(record)))
+    return record
+
+
+def test_an_idle_delivery_ends_when_its_owner_exits(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = _delivery_record(monitors, "midle")
+    monkeypatch.setattr(monitor_worker, "IDLE_CHECK", 0.1)
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", lambda *_: False)
+    finish = monitor_worker._Finish()  # a persistent command that stays silent
+    asyncio.run(
+        asyncio.wait_for(monitor_worker._deliver(monitors, "midle", record["owner"], finish), 5)
+    )
+
+
+def test_an_expired_final_pass_reads_nothing(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = _delivery_record(monitors, "mlate2")
+
+    def unexpected(_monitor_id):
+        raise AssertionError("read the store after the deadline")
+
+    monkeypatch.setattr(monitors, "has_pending", unexpected)
+    finish = monitor_worker._Finish(deadline=time.monotonic() - 1, final=True)
+    asyncio.run(monitor_worker._deliver(monitors, "mlate2", record["owner"], finish))
+
+
+def test_an_unreadable_boot_is_read_once(monkeypatch):
+    reads = []
+
+    def unreadable():
+        reads.append(1)
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(processes, "boot_id", unreadable)
+    assert processes.lifetime_alive(os.getpid(), "some-boot:1.0") is None
+    assert reads == [1]

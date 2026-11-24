@@ -143,9 +143,11 @@ def command_owner(session_id: str) -> Owner:
             try:
                 # The thread removes its entry under this lock, so only after this.
                 lookup.thread.start()
-            except RuntimeError as error:
+            except BaseException as error:  # no thread will remove it
                 del _LOOKUPS[session_id]
-                raise RuntimeError(f"cannot search for the agy process: {error}") from error
+                if isinstance(error, Exception):
+                    raise RuntimeError(f"cannot search for the agy process: {error}") from error
+                raise
     if not lookup.done.wait(OWNER_TIMEOUT):
         raise RuntimeError(
             f"the agy process of this command was not found in {OWNER_TIMEOUT} s; "
@@ -232,9 +234,11 @@ def _inspection(key: tuple[int, str, str]) -> _Inspection | None:
         try:
             # The thread removes its entry under this lock, so only after this.
             inspection.thread.start()
-        except RuntimeError:
+        except BaseException as error:  # no thread will remove it
             del _INSPECTIONS[key]
             inspection.done.set()
+            if not isinstance(error, Exception):
+                raise
         return inspection
 
 

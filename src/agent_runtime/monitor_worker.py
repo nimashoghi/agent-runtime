@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -22,6 +22,8 @@ from agent_runtime.processes import agy_alive, lifetime_alive, owner_alive, star
 
 # The final delivery pass after the command ends: two agentapi calls.
 FINAL_DELIVERY = 2 * agy.AGENTAPI_TIMEOUT
+# How often an idle delivery looks whether the owner process has exited.
+IDLE_CHECK = 5
 
 
 async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -134,6 +136,7 @@ async def run(directory: Path, identity: str) -> None:
                     text = line.decode("utf-8", errors="replace")
                     if observations and text.strip():
                         monitors.append(identity, text)
+                        finish.wake.set()
                     elif not observations:
                         sys.stderr.write(text + "\n")
                         sys.stderr.flush()
@@ -141,6 +144,7 @@ async def run(directory: Path, identity: str) -> None:
                 text = buffer.decode("utf-8", errors="replace")
                 if observations and text.strip():
                     monitors.append(identity, text)
+                    finish.wake.set()
                 elif not observations:
                     sys.stderr.write(text + "\n")
 
@@ -226,6 +230,7 @@ async def run(directory: Path, identity: str) -> None:
             if finish.deadline is None:
                 finish.deadline = time.monotonic() + FINAL_DELIVERY
             finish.final = True
+            finish.wake.set()
             # Bounded, so that a stuck inspection or store cannot keep the
             # worker, which holds the session's credentials: a send that
             # started before the deadline gets agentapi's own timeout.
@@ -270,6 +275,8 @@ class _Finish:
 
     deadline: float | None = None  # no send starts after it
     final: bool = False  # every event of the monitor is recorded
+    # Set when the worker records an event or finishes, to wake an idle delivery.
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Finish) -> None:
@@ -307,10 +314,12 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
         while True:
+            if late():  # before a read of the store or an inspection, which can wait
+                return "closed"
             # Nothing to send needs no inspection of the owner.
             if not monitors.has_pending(identity):
                 return "idle"
-            if late():  # before an inspection, which can be slow
+            if late():
                 return "closed"
             state = owner_state()
             if late():
@@ -333,6 +342,7 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
 
     while True:
         final = finish.final
+        finish.wake.clear()  # before the drain, so that an event during it wakes the wait
         try:
             result = await _in_thread(drain)
         except Exception as error:  # a store error: report it and try again
@@ -342,7 +352,17 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             # Nothing can wake a conversation whose process has exited; the
             # events wait for monitor_events.
             return
-        await asyncio.sleep(0.2 if result == "idle" else 1)
+        if result != "idle":
+            await asyncio.sleep(1)
+            continue
+        # Idle: wait for an event or the end, and look now and then (without a
+        # scan of its files) whether the owner process has exited.
+        try:
+            await asyncio.wait_for(finish.wake.wait(), timeout=IDLE_CHECK)
+        except TimeoutError:
+            ended = await _in_thread(lifetime_alive, owner["pid"], owner["start_token"])
+            if ended is False:
+                return
 
 
 if __name__ == "__main__":
