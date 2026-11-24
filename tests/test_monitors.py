@@ -200,8 +200,8 @@ def test_peer_messages_do_not_use_destination_own_token(inbox, monkeypatch):
 def test_agy_peers_are_labelled_prompting(inbox):
     # agy hooks report no permission mode.
     monitors, sid, frames, _, _ = inbox
+    # No registry record: an agy source needs none.
     source = str(uuid.uuid4())
-    monitors.registry.update("agy", source, cwd="/repo")
 
     receipt = send_claude_peer(
         sid, "peer context", registry=monitors.registry, source_identity=("agy", source)

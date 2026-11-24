@@ -72,21 +72,20 @@ class Monitors:
             and not value.get("pid")
             and time.time() - value["created_at"] > 60
         ):
-            value = self.update(
-                monitor_id, status="interrupted", error="monitor worker did not start"
-            )
+            value = self._interrupt(monitor_id, None, error="monitor worker did not start")
         return value
 
-    def _interrupt(self, monitor_id: str, pid: int) -> dict[str, Any]:
-        """Record that the worker exited, unless it recorded an outcome meanwhile."""
+    def _interrupt(
+        self, monitor_id: str, pid: int | None, *, error: str = "monitor worker exited"
+    ) -> dict[str, Any]:
+        """Record that the worker exited (or never started), unless it recorded a
+        PID or an outcome meanwhile: the check is in the write transaction."""
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
             if value["status"] in {"running", "starting"} and value.get("pid") == pid:
-                value.update(
-                    status="interrupted", error="monitor worker exited", updated_at=time.time()
-                )
+                value.update(status="interrupted", error=error, updated_at=time.time())
                 db.execute(
                     "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
                 )
@@ -187,6 +186,7 @@ class Monitors:
         environment = dict(os.environ) if provider == "agy" else without_agy(dict(os.environ))
         for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
             environment.pop(name, None)
+        child = None
         try:
             fd = os.open(
                 self.store.root / f"{identity}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
@@ -217,6 +217,10 @@ class Monitors:
             else:
                 self.update(identity, pid=child.pid, process_created_at=created)
         except Exception as error:
+            # A worker that started must not run on unseen: it stops its command
+            # on SIGTERM.
+            if child is not None and child.poll() is None:
+                child.terminate()
             self.update(identity, status="failed", error=str(error))
             raise
         return self.get(identity)
@@ -276,6 +280,14 @@ class Monitors:
                 [(row["id"],) for row in selected],
             )
         return selected
+
+    def settle(self, ids: list[int], status: str, error: str | None = None) -> None:
+        """Write one batch's receipt in one transaction."""
+        with self.store.connect() as db:
+            db.executemany(
+                "UPDATE monitor_events SET status=?,error=? WHERE id=?",
+                [(status, error, identity) for identity in ids],
+            )
 
     def delivered(self, identity: int, status: str, error: str | None = None) -> None:
         with self.store.connect() as db:

@@ -101,7 +101,12 @@ def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
         raise ValueError(
             "Codex retains output in monitor_get; its native monitor has no event cursor"
         )
-    return Monitors().events(owner_key(provider, session_id), after=after)
+    monitors = Monitors()
+    key = owner_key(provider, session_id)
+    # Reading the monitors records a worker that died while sending, so that its
+    # batch shows as uncertain here and not as dispatching.
+    monitors.list(key)
+    return monitors.events(key, after=after)
 
 
 def agents() -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import psutil
@@ -16,7 +17,7 @@ def _boot() -> str:
     """This boot of the machine on Linux, so that a start token never repeats
     across restarts; elsewhere the start is calendar time, which does not. An
     unreadable boot ID raises, so that no token is made without it."""
-    if not Path("/proc").is_dir():
+    if not sys.platform.startswith("linux"):
         return ""
     if not (boot := Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
         raise OSError("the boot ID is empty")

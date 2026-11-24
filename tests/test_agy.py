@@ -39,6 +39,7 @@ AGENTAPI = """\
 import json, os, pathlib, sys, time
 
 if pathlib.Path(RECORD + ".block").exists():
+    pathlib.Path(RECORD + ".started").touch()
     time.sleep(5)  # a send that is still running
 
 with open(RECORD, "a") as record:
@@ -276,7 +277,8 @@ def test_a_worker_that_dies_while_sending_leaves_its_batch_uncertain(conversatio
         {"name": "start", "command": "echo one; sleep 3", "persistent": True}
     )
     monitors = Monitors(agy.state)
-    wait_for(lambda: any(event["status"] == "dispatching" for event in agy.events()))
+    # Kill the worker while agentapi runs.
+    wait_for((agy.tmp / "agentapi.jsonl.started").exists)
     os.kill(monitors.get(monitor["monitor_id"])["pid"], signal.SIGKILL)
     wait_for(lambda: monitors.get(monitor["monitor_id"])["status"] == "interrupted")
     (event,) = agy.events()
