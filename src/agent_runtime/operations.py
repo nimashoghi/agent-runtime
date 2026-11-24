@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
 from agent_runtime import agy
-from agent_runtime.monitors import Monitors
+from agent_runtime.authority import without_agy
+from agent_runtime.monitors import Monitors, owner_key
 from agent_runtime.sessions import Provider, Registry, current_identity, send_claude_peer
 
 
 def codex_command(*arguments: str) -> Any:
+    # codexr acts for a Codex session, never with an agy command's authority.
     result = subprocess.run(
-        ["codexr", *arguments], check=True, capture_output=True, text=True, timeout=15
+        ["codexr", *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=without_agy(dict(os.environ)),
     )
     return json.loads(result.stdout)
 
@@ -68,7 +76,7 @@ def monitor_start(
 def monitor_list() -> list[dict[str, Any]]:
     provider, session_id = identity()
     if provider != "codex":
-        return Monitors().list(session_id)
+        return Monitors().list(owner_key(provider, session_id))
     return codex_command("monitors", "list", session_id)["monitors"]
 
 
@@ -77,7 +85,7 @@ def monitor_get(monitor_id: str) -> dict[str, Any]:
     if provider == "codex":
         return codex_command("monitors", "get", session_id, monitor_id)
     value = Monitors().get(monitor_id)
-    if value["session_id"] != session_id:
+    if value["session_id"] != owner_key(provider, session_id):
         raise ValueError("monitor belongs to another session")
     return value
 
@@ -96,10 +104,17 @@ def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
         raise ValueError(
             "Codex retains output in monitor_get; its native monitor has no event cursor"
         )
-    return Monitors().events(session_id, after=after)
+    return Monitors().events(owner_key(provider, session_id), after=after)
 
 
 def agents() -> list[dict[str, Any]]:
+    try:
+        provider, session_id = current_identity()
+    except RuntimeError:  # discovery also works from an ordinary shell
+        provider, session_id = None, ""
+    if provider == "agy":
+        # The first operation of a resumed agy session restarts its delivery.
+        agy.ensure_bridge(session_id)
     registry = Registry()
     values = [
         {**value, "provider": provider}

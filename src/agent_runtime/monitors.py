@@ -14,8 +14,18 @@ from typing import Any
 
 import psutil
 
+from agent_runtime.authority import AGY_CREDENTIALS
 from agent_runtime.claude import process_alive
-from agent_runtime.sessions import Registry, current_identity, permission_class
+from agent_runtime.sessions import Provider, Registry, current_identity, permission_class
+
+
+def owner_key(provider: Provider, session_id: str) -> str:
+    """The value of a monitor's session column for a native session.
+
+    Claude Code keeps the bare ID that earlier versions wrote. Other providers
+    are prefixed, so that equal session IDs of two hosts never share monitors.
+    """
+    return session_id if provider == "claude_code" else f"{provider}:{session_id}"
 
 
 class Monitors:
@@ -88,6 +98,7 @@ class Monitors:
         target = self.registry.get(provider, session_id)
         if not process_alive(target):
             raise RuntimeError("current native process is not live")
+        key = owner_key(provider, session_id)
         bridge = target.get("bridge")
         if (
             not isinstance(bridge, dict)
@@ -110,7 +121,7 @@ class Monitors:
         identity = "m" + uuid.uuid4().hex
         value = {
             "monitor_id": identity,
-            "session_id": session_id,
+            "session_id": key,
             "command": command,
             "description": description,
             "cwd": str(directory),
@@ -125,16 +136,13 @@ class Monitors:
             "owner": {"pid": target["pid"], "process_created_at": target["process_created_at"]},
         }
         with self.store.connect() as db:
-            db.execute(
-                "INSERT INTO monitors VALUES(?,?,?)", (identity, session_id, json.dumps(value))
-            )
+            db.execute("INSERT INTO monitors VALUES(?,?,?)", (identity, key, json.dumps(value)))
         environment = os.environ.copy()
         # The monitored command must not hold the session's message credentials.
         for name in (
             "CLAUDE_CODE_MESSAGING_TOKEN",
             "CLAUDE_CODE_MESSAGING_SOCKET",
-            "ANTIGRAVITY_LS_ADDRESS",
-            "ANTIGRAVITY_CSRF_TOKEN",
+            *AGY_CREDENTIALS,
         ):
             environment.pop(name, None)
         try:
@@ -225,7 +233,7 @@ class Monitors:
         with self.store.connect() as db:
             db.execute(
                 "UPDATE monitor_events SET status='uncertain',"
-                "error='delivery bridge exited during socket write' "
+                "error='delivery bridge exited during a delivery attempt' "
                 "WHERE session_id=? AND status='dispatching'",
                 (session_id,),
             )

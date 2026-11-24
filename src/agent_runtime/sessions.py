@@ -74,17 +74,33 @@ class Registry:
             )
         return json.loads(row[0])
 
-    def live_sessions(self, provider: Provider) -> list[dict[str, Any]]:
-        """The registered sessions of a provider whose native process is live."""
+    def live_sessions(self, provider: Literal["claude_code", "agy"]) -> list[dict[str, Any]]:
+        """The registered sessions of a provider whose native process is live.
+
+        Codex records have no process; ``codexr agents list`` lists Codex roots.
+        """
         with self.store.connect() as db:
             rows = db.execute("SELECT value FROM sessions WHERE provider=?", (provider,)).fetchall()
         return [record for row in rows if process_alive(record := json.loads(row[0]))]
+
+    def claude_sessions(self) -> list[dict[str, Any]]:
+        return self.live_sessions("claude_code")
 
 
 def current_identity() -> tuple[Provider, str]:
     provider = os.environ.get("AGENT_SESSION_PROVIDER")
     if provider == "claude_code" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "claude_code", identity
+    # A command inherits the identity of every session around it. Which of an agy
+    # conversation and a Claude or Codex session is the nearer one cannot be told
+    # from the environment, so refuse to guess.
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") and (
+        os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
+    ):
+        raise RuntimeError(
+            "ambiguous native identity: an agy conversation and a Claude or Codex session; "
+            "start the session without the other's environment"
+        )
     if identity := os.environ.get("CLAUDE_CODE_SESSION_ID"):
         return "claude_code", identity
     if identity := os.environ.get("CODEX_THREAD_ID"):
