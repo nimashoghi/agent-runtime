@@ -2,15 +2,14 @@
 
 ## 0.3.0
 
-- agy (Antigravity CLI) sessions, provider `"agy"`. The hooks accept the host argument `agy` (typed-agent-hooks 0.4) and record an agy conversation with its agy process. Monitors that a command of an agy session starts reach that session: a delivery bridge, which the session's first operation starts with its inherited credentials, wakes it with `agentapi send-message` and a notice of the waiting events, which the agent reads with `monitor_events`. agy sessions appear in `agents()`, and an agy session can send peer context to Claude Code sessions (with the `prompting` class, because agy reports no permission mode) and to Codex sessions. `send("agy", ...)` raises: no other process can message an agy session. The README section on agy gives the limits.
+- agy (Antigravity CLI) sessions, provider `"agy"`. The hooks accept the host argument `agy` (typed-agent-hooks 0.4) and record an agy conversation with its agy process for `agents()`. A monitor that a command of an agy session starts reaches that session: its worker keeps the command's credentials and wakes the conversation with `agentapi send-message` and a notice of the waiting events, which the agent reads with `monitor_events`. agy sessions appear in `agents()`, and an agy session can send peer context to Claude Code sessions (with the `prompting` class, because agy reports no permission mode) and to Codex sessions. `send("agy", ...)` raises: no other process can message an agy session. The README section on agy gives the limits.
 - agy monitors are stored under `agy:<session ID>`, so that a Claude Code and an agy session with the same ID never share monitors. Claude Code monitors keep the bare session ID; Codex monitors stay in codexr.
 - The monitored command, a Claude worker, the Claude delivery child and `codexr` do not inherit an agy session's identity or credentials.
 - `current_identity()` raises `AmbiguousIdentity` for an environment that has an agy conversation and a Claude, Codex or managed session, and `IdentityUnavailable` when there is none; both are `RuntimeError`s.
 - `monitor_get` and `monitor_stop` reject another session's monitor before they read its state.
-- `Monitors.start` takes `owner` (an agy process lifetime) and refuses an agy monitor without it; `Monitors.claim` takes an `owner` that it checks in its transaction. `agent_runtime.processes` holds the clock-independent process identity.
-- The monitor worker resets an inherited `SIGCHLD` disposition and records a start token, by which `Monitors.get` judges it without creation times.
-- An interrupted delivery records "delivery bridge exited during a delivery attempt".
-- Requires `typed-agent-hooks>=0.4,<0.5`.
+- `Monitors.claim_monitor(monitor_id)` claims one monitor's events. `agent_runtime.processes` holds a process identity that a step of the clock does not change, which the monitor worker now records and `Monitors.get` uses; the worker also resets an inherited `SIGCHLD` disposition, and so does `codexr`'s caller.
+- An interrupted delivery records "delivery exited during a delivery attempt".
+- Requires `typed-agent-hooks>=0.4,<0.5` and `psutil>=7.1,<8`.
 
 ## 0.2.4
 

@@ -8,10 +8,10 @@ import sys
 import time
 import uuid
 
+import psutil
 import pytest
 
 from agent_runtime import operations
-from agent_runtime.claude import process_alive
 from agent_runtime.hooks import app
 from agent_runtime.monitors import Monitors
 from agent_runtime.sessions import (
@@ -210,11 +210,11 @@ def conversation(tmp_path):
 def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
     agy = conversation
     process, monitor = agy.run({"name": "start", "command": PROBE})
-    registry = Registry(agy.state)
-    session = registry.get("agy", agy.session_id)
+    session = Registry(agy.state).get("agy", agy.session_id)
     assert (session["pid"], session["cwd"]) == (process.pid, str(agy.tmp))
     assert monitor["session_id"] == f"agy:{agy.session_id}"
     assert monitor["permission_class"] == "prompting"
+    assert monitor["owner"]["pid"] == process.pid
     # The output lines and the completion notice, each delivered.
     events = wait_for(
         lambda: (
@@ -232,35 +232,36 @@ def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
     # The notice names the events; the output itself stays out of agy's system role.
     assert "monitor_events(after=" in sent[0]["argv"][3]
     assert all("first" not in call["argv"][3] for call in sent)
-    bridge = registry.get("agy", agy.session_id)["bridge"]
-    assert bridge["native_pid"] == process.pid
     assert b"fixture-token" not in (agy.state / "runtime.sqlite3").read_bytes()
-    process.terminate()
-    process.wait(timeout=5)
-    # The bridge exits with its agy process.
-    wait_for(lambda: not process_alive(bridge))
+    # The worker, which held the credentials, ends with its command.
+    worker = Monitors(agy.state).get(monitor["monitor_id"])
+    assert worker["status"] == "completed"
+    wait_for(
+        lambda: (
+            not psutil.pid_exists(worker["pid"])
+            or psutil.Process(worker["pid"]).status() == psutil.STATUS_ZOMBIE
+        )
+    )
 
 
-def test_a_resumed_session_gets_the_output_of_a_persistent_monitor(conversation):
+def test_a_persistent_monitor_keeps_its_output_for_the_resumed_session(conversation):
     agy = conversation
     first, monitor = agy.run(
-        {"name": "start", "command": "sleep 2; echo after-resume", "persistent": True}
+        {"name": "start", "command": "sleep 2; echo after-exit", "persistent": True}
     )
     assert "error" not in monitor
     first.terminate()
     first.wait(timeout=5)
-    # The output and the completion notice wait for the resumed session.
+    # The output and the completion notice wait: nothing can wake a session
+    # whose agy process is gone.
     wait_for(
         lambda: len(found := agy.events()) == 2 and all(e["status"] == "pending" for e in found)
     )
     assert not agy.calls()
-    # A new agy process of the same conversation, with its own credentials,
-    # runs any operation; its bridge delivers with them.
-    second, listed = agy.run({"name": "list"}, token="fixture-token-2")
-    assert [value["monitor_id"] for value in listed] == [monitor["monitor_id"]]
-    wait_for(lambda: all(event["status"] == "transport-written" for event in agy.events()))
-    assert agy.calls() and all(call["token"] == "second" for call in agy.calls())
-    assert Registry(agy.state).get("agy", agy.session_id)["bridge"]["native_pid"] == second.pid
+    # The resumed session reads them.
+    _second, events = agy.run({"name": "events"}, token="fixture-token-2")
+    assert events[0]["text"] == "after-exit"
+    assert not agy.calls()
 
 
 def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
@@ -276,13 +277,6 @@ def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
     )
     assert all(event["error"] == "agentapi exited with status 1" for event in events)
     assert b"fixture-token" not in (agy.state / "runtime.sqlite3").read_bytes()
-
-
-def test_a_command_of_an_unregistered_agy_process_starts_no_bridge(conversation):
-    agy = conversation
-    _process, result = agy.run({"name": "start", "command": "echo one"}, hook=False)
-    assert "has not registered agent-runtime hooks" in result["error"]
-    assert not agy.calls()
 
 
 def test_an_agy_session_does_not_see_a_claude_monitor_of_the_same_id(conversation):
@@ -310,7 +304,7 @@ def test_an_agy_session_does_not_see_a_claude_monitor_of_the_same_id(conversatio
     assert json.loads(row[0])["status"] == "running"
 
 
-def test_an_agy_monitor_starts_only_for_a_verified_agy_process(tmp_path, monkeypatch):
+def test_an_agy_monitor_starts_only_from_a_command_of_the_session(tmp_path, monkeypatch):
     for name in (
         "AGENT_SESSION_PROVIDER",
         "AGENT_SESSION_ID",
@@ -318,9 +312,11 @@ def test_an_agy_monitor_starts_only_for_a_verified_agy_process(tmp_path, monkeyp
         "CODEX_THREAD_ID",
     ):
         monkeypatch.delenv(name, raising=False)
+    for name in ("ANTIGRAVITY_LS_ADDRESS", "ANTIGRAVITY_CSRF_TOKEN", "ANTIGRAVITY_AGENTAPI_EXE"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", str(uuid.uuid4()))
 
-    with pytest.raises(ValueError, match=r"through agent_runtime\.operations"):
+    with pytest.raises(RuntimeError, match="credentials are unavailable"):
         Monitors(tmp_path / "state").start("echo one", description="direct")
 
 

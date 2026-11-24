@@ -12,21 +12,32 @@ from agent_runtime.claude import process_alive
 AGY_CONVERSATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 
 
+def _boot() -> str:
+    """This boot of the machine on Linux, so that a start token never repeats
+    across restarts; elsewhere the start is calendar time, which does not."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":"
+    except OSError:
+        return ""
+
+
 def start_token(process: psutil.Process) -> str:
     """When the process started, as a value that one process lifetime keeps.
 
-    This is psutil's own identity of a process lifetime (``Process._get_ident``):
-    the start that the kernel recorded, without the adjustment to the current
-    clock that the public create_time() makes, so a clock step leaves it alone.
+    This is psutil's own identity of a process lifetime (``Process._get_ident``,
+    psutil 7.1 and newer): the start that the kernel recorded, without the
+    adjustment to the current clock that the public create_time() makes, so a
+    clock step leaves it alone.
     """
     platform_process = getattr(process, "_proc")  # noqa: B009 - psutil's private handle
-    return repr(platform_process.create_time(monotonic=True))
+    return _boot() + repr(platform_process.create_time(monotonic=True))
 
 
 def lifetime_alive(pid: int, token: str) -> bool | None:
     """Whether the process of this lifetime runs; None when it cannot be inspected."""
     try:
-        return start_token(psutil.Process(pid)) == token
+        process = psutil.Process(pid)
+        return start_token(process) == token and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
     except psutil.AccessDenied:
@@ -52,16 +63,18 @@ def holds(process: psutil.Process, lock: Path) -> bool:
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
     """Whether the agy process of this lifetime still holds the conversation;
-    None when this process may not inspect it."""
+    None when this process may not inspect it. The lifetime is checked again
+    after the open files, with a fresh look, so a PID that changed hands in
+    between does not count."""
+    if lifetime_alive(pid, token) is not True:
+        return lifetime_alive(pid, token)
     try:
-        process = psutil.Process(pid)
-        if start_token(process) != token:
-            return False  # the PID belongs to another process now
-        return holds(process, presence_lock(session_id))
+        held = holds(psutil.Process(pid), presence_lock(session_id))
     except psutil.NoSuchProcess:
         return False
     except (psutil.AccessDenied, OSError):
         return None
+    return held and lifetime_alive(pid, token) is True
 
 
 def owner_alive(owner: dict) -> bool:

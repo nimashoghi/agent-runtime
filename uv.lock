@@ -38,7 +38,7 @@ requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = "==0.2.159" },
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
-    { name = "psutil", specifier = ">=7,<8" },
+    { name = "psutil", specifier = ">=7.1,<8" },
     { name = "typed-agent-hooks", editable = "../typed-agent-hooks" },
 ]
 provides-extras = ["claude"]

@@ -10,9 +10,11 @@ from pathlib import Path
 
 import psutil
 
+from agent_runtime import agy
+from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import owner_alive, start_token
+from agent_runtime.processes import agy_alive, owner_alive, start_token
 
 
 async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -43,6 +45,25 @@ async def run(directory: Path, identity: str) -> None:
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
+    owner = value["owner"]
+    # The worker of an agy monitor delivers its own events with the credentials
+    # of the command that started it; nothing else claims them.
+    delivering = "start_token" in owner
+
+    async def deliver() -> None:
+        if not delivering:
+            return
+        if agy_alive(owner["pid"], owner["start_token"], owner["conversation"]) is False:
+            return  # they wait for monitor_events in the session that resumes it
+        while events := monitors.claim_monitor(identity):
+            text = agy.notice(owner["conversation"], events)
+            status, detail = await asyncio.to_thread(agy.send_notice, owner["conversation"], text)
+            for event in events:
+                monitors.delivered(event["id"], status, detail)
+            if status != "transport-written":
+                return
+
+    delivered_at = 0.0
     child = None
     child_created = None
     descendants = {}
@@ -57,6 +78,8 @@ async def run(directory: Path, identity: str) -> None:
             cwd=value["cwd"],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # The monitored command is not the session.
+            env=without_agy(dict(os.environ)),
             start_new_session=True,
         )
         with suppress(psutil.NoSuchProcess):
@@ -120,6 +143,9 @@ async def run(directory: Path, identity: str) -> None:
             for reader in readers:
                 if reader.done() and (error := reader.exception()) is not None:
                     raise error
+            if time.monotonic() - delivered_at >= 0.2:
+                await deliver()
+                delivered_at = time.monotonic()
             await asyncio.sleep(0.1)
         # Stop can win the race with a normal exit; record the exit code then too.
         await exited(child, 5)
@@ -141,9 +167,12 @@ async def run(directory: Path, identity: str) -> None:
         )
         monitors.update(identity, status=status, exit_code=child.returncode)
         monitors.append(identity, f"Monitor {identity} {status} (exit code {child.returncode}).")
+        await deliver()
     except Exception as error:
         monitors.update(identity, status="failed", error=str(error))
         monitors.append(identity, f"Monitor {identity} failed: {error}")
+        with suppress(Exception):
+            await deliver()
         raise
     finally:
         for pid, created in descendants.items():

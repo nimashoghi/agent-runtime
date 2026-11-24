@@ -14,6 +14,7 @@ from typing import Any
 
 import psutil
 
+from agent_runtime import agy
 from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.processes import lifetime_alive
@@ -63,6 +64,9 @@ class Monitors:
             and not _worker_alive(value)
         ):
             value = self.update(monitor_id, status="interrupted", error="monitor worker exited")
+            # An agy worker delivers its own events; one that died sending leaves
+            # them neither sent nor pending.
+            self.interrupted_delivery(value["session_id"], monitor_id=monitor_id)
         if (
             value["status"] == "starting"
             and not value.get("pid")
@@ -105,57 +109,48 @@ class Monitors:
         persistent: bool = False,
         cwd: Path | None = None,
         timeout_ms: int = 300_000,
-        owner: tuple[int, str] | None = None,
     ) -> dict[str, Any]:
         """Start a monitor for the current native session.
 
-        For agy, owner is the agy process lifetime (PID, start token) that the
-        caller verified (agent_runtime.operations does); the monitor is created
-        only while the session's record names it, in the same transaction.
+        An agy monitor must start from a command of the agy session: its worker
+        keeps that command's credentials to deliver its own observations, and
+        its owner is that command's agy process. Its cwd defaults to the
+        command's.
         """
         provider, session_id = current_identity()
         if provider == "codex":
             raise ValueError("use the Codex monitor adapter for a Codex session")
-        if provider == "agy" and owner is None:
-            raise ValueError("start agy monitors through agent_runtime.operations")
-        target = self.registry.get(provider, session_id)
-        if provider == "claude_code" and not process_alive(target):
-            raise RuntimeError("current native process is not live")
-        key = owner_key(provider, session_id)
-        bridge = target.get("bridge")
-        if provider == "agy":
-            assert owner is not None
-            running = (
-                isinstance(bridge, dict)
-                and lifetime_alive(bridge.get("pid", 0), bridge.get("start_token", "")) is not False
-                and (bridge.get("native_pid"), bridge.get("native_start")) == owner
-            )
-        else:
-            running = (
-                isinstance(bridge, dict)
-                and process_alive(bridge)
-                and bridge.get("native_pid") == target["pid"]
-            )
-        if not running:
-            start = (
-                "check agent-runtime hooks"
-                if provider == "claude_code"
-                else "start agy monitors through agent_runtime.operations"
-            )
-            raise RuntimeError(f"the native monitor delivery bridge is not running; {start}")
         if not command.strip() or not description.strip():
             raise ValueError("command and description must be nonempty")
         if isinstance(timeout_ms, bool) or timeout_ms <= 0 or not math.isfinite(timeout_ms):
             raise ValueError("timeout_ms must be positive and finite")
-        directory = (cwd or Path(target["cwd"])).resolve(strict=True)
+        if provider == "agy":
+            pid, token = agy.command_owner(session_id)
+            owner = {"pid": pid, "start_token": token, "conversation": session_id}
+            # agy hooks report no permission mode, so agy monitors get the cautious class.
+            mode = "prompting"
+            default_cwd = Path.cwd()
+        else:
+            target = self.registry.get(provider, session_id)
+            if not process_alive(target):
+                raise RuntimeError("current Claude process is not live")
+            bridge = target.get("bridge")
+            if (
+                not isinstance(bridge, dict)
+                or not process_alive(bridge)
+                or bridge.get("native_pid") != target["pid"]
+            ):
+                raise RuntimeError(
+                    "the native monitor delivery bridge is not running; check agent-runtime hooks"
+                )
+            owner = {"pid": target["pid"], "process_created_at": target["process_created_at"]}
+            mode = permission_class(target.get("permission_mode"))
+            default_cwd = Path(target["cwd"])
+        directory = (cwd or default_cwd).resolve(strict=True)
         if not directory.is_dir():
             raise ValueError("cwd must be a directory")
         identity = "m" + uuid.uuid4().hex
-        if owner is not None:
-            # An agy owner lives while its lifetime holds the conversation.
-            lifetime = {"pid": owner[0], "start_token": owner[1], "conversation": session_id}
-        else:
-            lifetime = {"pid": target["pid"], "process_created_at": target["process_created_at"]}
+        key = owner_key(provider, session_id)
         value = {
             "monitor_id": identity,
             "session_id": key,
@@ -166,25 +161,15 @@ class Monitors:
             "persistent": persistent,
             "status": "starting",
             "created_at": time.time(),
-            # agy hooks report no permission mode, so agy monitors get the cautious class.
-            "permission_class": "prompting"
-            if provider == "agy"
-            else permission_class(target.get("permission_mode")),
-            "owner": lifetime,
+            "permission_class": mode,
+            "owner": owner,
         }
         with self.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if owner is not None:
-                row = db.execute(
-                    "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, session_id)
-                ).fetchone()
-                current = json.loads(row[0]) if row else {}
-                if (current.get("pid"), current.get("native_start")) != owner:
-                    raise RuntimeError("the session moved to another native process")
             db.execute("INSERT INTO monitors VALUES(?,?,?)", (identity, key, json.dumps(value)))
-        # The monitored command is not the session: it gets neither its message
-        # credentials nor an agy session's identity.
-        environment = without_agy(dict(os.environ))
+        # The worker of an agy monitor keeps the command's agy credentials and
+        # gives the monitored command none of them; a Claude monitor's worker
+        # gets neither Claude's nor agy's.
+        environment = dict(os.environ) if provider == "agy" else without_agy(dict(os.environ))
         for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
             environment.pop(name, None)
         try:
@@ -195,6 +180,9 @@ class Monitors:
                 child = subprocess.Popen(
                     [
                         sys.executable,
+                        # An agy worker holds the session's token: no PYTHON*
+                        # variable, user site or working folder may choose its code.
+                        *(["-I"] if provider == "agy" else []),
                         "-m",
                         "agent_runtime.monitor_worker",
                         str(self.store.root),
@@ -204,6 +192,7 @@ class Monitors:
                     stdout=output,
                     stderr=output,
                     env=environment,
+                    cwd=self.store.root if provider == "agy" else None,
                     start_new_session=True,
                 )
             try:
@@ -244,27 +233,21 @@ class Monitors:
                 )
             ]
 
-    def claim(
-        self, session_id: str, *, owner: tuple[Provider, str, int, str] | None = None
-    ) -> list[dict[str, Any]]:
-        """Mark up to 32 pending events dispatching and return them. With owner
-        (provider, native session ID, PID, start token), claim nothing unless the
-        session's record still names that process lifetime, in the same
-        transaction."""
+    def claim(self, session_id: str) -> list[dict[str, Any]]:
+        return self._claim("session_id", session_id)
+
+    def claim_monitor(self, monitor_id: str) -> list[dict[str, Any]]:
+        """Claim the pending events of one monitor; its agy worker is their only claimant."""
+        return self._claim("monitor_id", monitor_id)
+
+    def _claim(self, column: str, value: str) -> list[dict[str, Any]]:
+        assert column in ("session_id", "monitor_id")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if owner is not None:
-                provider, native_id, pid, token = owner
-                row = db.execute(
-                    "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, native_id)
-                ).fetchone()
-                current = json.loads(row[0]) if row else {}
-                if (current.get("pid"), current.get("native_start")) != (pid, token):
-                    return []
             rows = db.execute(
-                "SELECT * FROM monitor_events WHERE session_id=? AND status='pending' "
+                f"SELECT * FROM monitor_events WHERE {column}=? AND status='pending' "
                 "ORDER BY id LIMIT 32",
-                (session_id,),
+                (value,),
             ).fetchall()
             total = 0
             selected = []
@@ -285,11 +268,12 @@ class Monitors:
                 "UPDATE monitor_events SET status=?,error=? WHERE id=?", (status, error, identity)
             )
 
-    def interrupted_delivery(self, session_id: str) -> None:
+    def interrupted_delivery(self, session_id: str, *, monitor_id: str | None = None) -> None:
+        """Mark the events that a delivery that ended left dispatching uncertain."""
         with self.store.connect() as db:
             db.execute(
                 "UPDATE monitor_events SET status='uncertain',"
-                "error='delivery bridge exited during a delivery attempt' "
-                "WHERE session_id=? AND status='dispatching'",
-                (session_id,),
+                "error='delivery exited during a delivery attempt' "
+                "WHERE session_id=? AND status='dispatching' AND (? IS NULL OR monitor_id=?)",
+                (session_id, monitor_id, monitor_id),
             )
