@@ -307,6 +307,9 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
         while True:
+            # Nothing to send needs no inspection of the owner.
+            if not monitors.has_pending(identity):
+                return "idle"
             if late():  # before an inspection, which can be slow
                 return "closed"
             state = owner_state()

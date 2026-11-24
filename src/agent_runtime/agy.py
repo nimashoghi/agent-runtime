@@ -114,6 +114,15 @@ _LOOKUPS_LOCK = threading.Lock()
 _MAX_LOOKUPS = 4
 
 
+def _after_fork_in_child() -> None:
+    # The threads of the parent's lookups and inspections do not exist here.
+    global _LOOKUPS_LOCK, _INSPECTIONS_LOCK
+    _LOOKUPS.clear()
+    _LOOKUPS_LOCK = threading.Lock()
+    _INSPECTIONS.clear()
+    _INSPECTIONS_LOCK = threading.Lock()
+
+
 def command_owner(session_id: str) -> Owner:
     """The agy process lifetime whose credentials this command holds."""
     if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != agy_conversation(session_id):
@@ -131,7 +140,12 @@ def command_owner(session_id: str) -> Owner:
             if len(_LOOKUPS) >= _MAX_LOOKUPS:
                 raise RuntimeError("earlier searches for agy processes have not ended")
             lookup = _LOOKUPS[session_id] = _Lookup(session_id)
-            lookup.thread.start()
+            try:
+                # The thread removes its entry under this lock, so only after this.
+                lookup.thread.start()
+            except RuntimeError as error:
+                del _LOOKUPS[session_id]
+                raise RuntimeError(f"cannot search for the agy process: {error}") from error
     if not lookup.done.wait(OWNER_TIMEOUT):
         raise RuntimeError(
             f"the agy process of this command was not found in {OWNER_TIMEOUT} s; "
@@ -202,6 +216,8 @@ class _Inspection:
 _INSPECTIONS: dict[tuple[int, str, str], _Inspection] = {}
 _INSPECTIONS_LOCK = threading.Lock()
 _MAX_INSPECTIONS = 32
+
+os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _inspection(key: tuple[int, str, str]) -> _Inspection | None:

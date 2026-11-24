@@ -7,7 +7,6 @@ import errno
 import os
 import re
 import sys
-from contextlib import suppress
 from pathlib import Path
 
 import psutil
@@ -31,35 +30,34 @@ def boot_id() -> str:
     return boot
 
 
-def _boot() -> str:
-    # The boot, so that a start token never repeats across restarts.
-    return boot_id() + ":"
-
-
-def start_token(process: psutil.Process) -> str:
+def start_token(process: psutil.Process, boot: str | None = None) -> str:
     """When the process started, as a value that one process lifetime keeps.
 
     This is psutil's own identity of a process lifetime (``Process._get_ident``,
     psutil 7.1 and newer): the start that the kernel recorded, without the
     adjustment to the current clock that the public create_time() makes, so a
-    clock step leaves it alone. The boot comes first, so that it never repeats
-    across restarts.
+    clock step leaves it alone. The boot (boot_id() unless given) comes first,
+    so that it never repeats across restarts.
     """
     platform_process = getattr(process, "_proc")  # noqa: B009 - psutil's private handle
-    return _boot() + repr(platform_process.create_time(monotonic=True))
+    prefix = boot if boot is not None else boot_id()
+    return f"{prefix}:{platform_process.create_time(monotonic=True)!r}"
 
 
 def lifetime_alive(pid: int, token: str) -> bool | None:
     """Whether the process of this lifetime runs; None when it cannot be inspected."""
-    with suppress(OSError):  # without the boot ID, the process itself tells
-        if token.rpartition(":")[0] != boot_id():
-            return False  # a lifetime of another boot
+    try:
+        boot = boot_id()
+    except OSError:  # without the boot ID, the process itself tells
+        boot = None
+    if boot is not None and token.rpartition(":")[0] != boot:
+        return False  # a lifetime of another boot
     try:
         process = psutil.Process(pid)
         # A zombie has exited, whoever's it is; this needs no boot ID.
         if process.status() == psutil.STATUS_ZOMBIE:
             return False
-        return start_token(process) == token and process.status() != psutil.STATUS_ZOMBIE
+        return start_token(process, boot) == token and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
     except (psutil.AccessDenied, OSError):

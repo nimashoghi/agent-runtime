@@ -151,11 +151,16 @@ class Monitors:
         return value
 
     def _launch_failed(self, monitor_id: str, error: Exception) -> None:
-        """Record that no worker started, unless a stop was recorded meanwhile."""
+        """Record that no worker started, unless an outcome was recorded
+        meanwhile; a stop request comes first, as in begin() and get()."""
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
-            if (value := json.loads(row[0]))["status"] == "starting":
+            if (value := json.loads(row[0]))["status"] != "starting":
+                return
+            if value.get("stop_requested"):
+                _end(db, value, "stopped", STOPPED_BEFORE_START, before_start=True)
+            else:
                 _end(db, value, "failed", None, error=str(error))
 
     def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
@@ -379,6 +384,17 @@ class Monitors:
 
     def claim(self, session_id: str) -> list[dict[str, Any]]:
         return self._claim("session_id", session_id)
+
+    def has_pending(self, monitor_id: str) -> bool:
+        """Whether a monitor has events that wait to be sent."""
+        with self.store.connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM monitor_events WHERE monitor_id=? AND status='pending' LIMIT 1",
+                    (monitor_id,),
+                ).fetchone()
+                is not None
+            )
 
     def claim_monitor(self, monitor_id: str) -> list[dict[str, Any]]:
         """Claim the pending events of one monitor; its agy worker is their only claimant."""

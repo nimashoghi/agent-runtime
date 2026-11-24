@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from contextlib import suppress
 
 import psutil
@@ -785,8 +786,62 @@ def test_only_the_end_of_its_process_ends_an_agy_owner(tmp_path, monkeypatch):
     # No presence lock is held: that delays sends, and does not end the monitor.
     assert processes.agy_alive(os.getpid(), token, "c1") is False
     assert processes.owner_alive(owner) is True
-    # A lifetime of another boot has ended, whoever has its PID now.
+
+    # A lifetime of another boot has ended, even when its PID cannot be inspected.
+    def denied(pid):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(processes.psutil, "Process", denied)
     assert processes.lifetime_alive(1, "another-boot:1.0") is False
+    assert processes.lifetime_alive(1, f"{processes.boot_id()}:1.0") is None
+
+
+def test_delivery_waits_out_a_scan_that_misses_the_lock(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mscan",
+        "session_id": "agy:c1",
+        "status": "completed",
+        "created_at": time.time(),
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mscan", "agy:c1", json.dumps(record)))
+    monitors.append("mscan", "one")
+    scans = iter([False])  # the first scan misses the lock, every later one finds it
+    sent = []
+    monkeypatch.setattr(monitor_worker, "agy_alive", lambda *_: next(scans, True))
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", lambda *_: True)
+
+    def send(conversation, text, confirm):
+        assert confirm()
+        sent.append(conversation)
+        return "transport-written", None
+
+    monkeypatch.setattr(monitor_worker.agy, "send_notice", send)
+    finish = monitor_worker._Finish(deadline=time.monotonic() + 30, final=True)
+    asyncio.run(monitor_worker._deliver(monitors, "mscan", record["owner"], finish))
+    assert sent == ["c1"]
+    assert [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]
+
+
+def test_a_launch_failure_after_a_stop_request_ends_stopped(tmp_path):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mreq",
+        "session_id": "agy:c1",
+        "status": "starting",
+        "stop_requested": True,
+        "created_at": time.time(),
+        "started": {"boot": None, "monotonic": time.monotonic()},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mreq", "agy:c1", json.dumps(record)))
+    monitors._launch_failed("mreq", OSError("no worker"))
+    assert monitors.get("mreq")["status"] == "stopped"
+    (event,) = monitors.events("agy:c1")
+    assert event["text"] == "Monitor mreq stopped before its command started."
 
 
 def test_a_launch_failure_after_a_stop_keeps_the_stop(tmp_path):
@@ -821,9 +876,37 @@ def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
             with pytest.raises(RuntimeError, match="was not found"):
                 agy_module.command_owner("c2")
         assert len(agy_module._LOOKUPS) == 1
+        # A forked child has none of the parent's lookups, whose threads it lacks.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork of a threaded process
+            if (child := os.fork()) == 0:
+                os._exit(0 if not agy_module._LOOKUPS else 1)
+        assert os.waitpid(child, 0)[1] == 0
     finally:
         release.set()
     wait_for(lambda: not agy_module._LOOKUPS)
+
+
+def test_a_lookup_whose_thread_cannot_start_leaves_no_slot(monkeypatch):
+    for name, value in {
+        "ANTIGRAVITY_CONVERSATION_ID": "c3",
+        "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+        "ANTIGRAVITY_CSRF_TOKEN": "fixture-token",
+        "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(agy_module, "native_process", lambda _session_id: (1, "t"))
+    start = threading.Thread.start
+
+    def refused(_thread):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refused)
+    with pytest.raises(RuntimeError, match="cannot search"):
+        agy_module.command_owner("c3")
+    assert not agy_module._LOOKUPS
+    monkeypatch.setattr(threading.Thread, "start", start)
+    assert agy_module.command_owner("c3") == (1, "t")
 
 
 def test_a_monitor_starts_without_a_hook_record_in_the_command_folder(conversation):
