@@ -936,8 +936,22 @@ def test_an_interrupted_start_leaves_its_replacement_alone(monkeypatch, registry
 
     monkeypatch.setattr(agy_module, "native_process", scan)
     monkeypatch.setattr(agy_module, "agy_alive", scan)
+    kind = agy_module._Lookup if registry == "lookup" else agy_module._Inspection
     entries = agy_module._LOOKUPS if registry == "lookup" else agy_module._INSPECTIONS
     key = "c4" if registry == "lookup" else (4, "t", "c4")
+    # The abandoned thread waits before its ownership check until the
+    # replacement runs, so that it finds the replacement under its key.
+    gate = threading.Event()
+    runs = []
+    original = kind._run
+
+    def gated(self, *args):
+        runs.append(self)
+        if len(runs) == 1:
+            gate.wait(5)
+        return original(self, *args)
+
+    monkeypatch.setattr(kind, "_run", gated)
 
     def begin():
         if registry == "lookup":
@@ -958,15 +972,17 @@ def test_an_interrupted_start_leaves_its_replacement_alone(monkeypatch, registry
         begin()
     monkeypatch.setattr(threading.Thread, "start", start)
     (first,) = abandoned
-    first.join(5)  # it found its entry gone and did nothing
-    assert not first.is_alive() and not entries and scans == []
-    # A replacement scans once and stays registered while it runs.
+    assert not entries
     retry = threading.Thread(target=begin, daemon=True)
     retry.start()
     try:
-        assert scanning.wait(5)
+        assert scanning.wait(5)  # the replacement is registered and scans
+        gate.set()
+        first.join(5)
+        assert not first.is_alive()
         assert key in entries and scans == [1]
     finally:
+        gate.set()
         release.set()
         retry.join(5)
     wait_for(lambda: not entries)
@@ -1169,4 +1185,44 @@ def test_an_idle_check_that_stalls_does_not_hold_up_a_send(tmp_path, monkeypatch
         sent = _idle_delivery(tmp_path, monkeypatch, "mstall", lambda *_: stalled.wait(30))
     finally:
         stalled.set()
+    assert sent == ["c1"]
+
+
+def test_the_end_of_the_worker_cuts_a_retry_backoff_short(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = _delivery_record(monitors, "mback")
+    monitors.append("mback", "the outcome")
+    scanned = threading.Event()
+    sent = []
+
+    def scan(*_):
+        # The first scan misses the lock; it is held again right after.
+        first = not scanned.is_set()
+        scanned.set()
+        return None if first else True
+
+    monkeypatch.setattr(monitor_worker, "agy_alive", scan)
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", lambda *_: True)
+
+    def send(conversation, _text, confirm):
+        assert confirm()
+        sent.append(conversation)
+        return "transport-written", None
+
+    monkeypatch.setattr(monitor_worker.agy, "send_notice", send)
+    finish = monitor_worker._Finish()
+
+    async def scenario():
+        delivery = asyncio.ensure_future(
+            monitor_worker._deliver(monitors, "mback", record["owner"], finish)
+        )
+        while not scanned.is_set():
+            await asyncio.sleep(0.01)
+        # The worker finishes with less time left than one backoff.
+        finish.deadline, finish.final = time.monotonic() + 0.5, True
+        finish.ended.set()
+        finish.wake.set()
+        await asyncio.wait_for(delivery, 5)
+
+    asyncio.run(scenario())
     assert sent == ["c1"]

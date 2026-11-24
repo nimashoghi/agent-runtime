@@ -232,6 +232,7 @@ async def run(directory: Path, identity: str) -> None:
             if finish.deadline is None:
                 finish.deadline = time.monotonic() + FINAL_DELIVERY
             finish.final = True
+            finish.ended.set()
             finish.wake.set()
             # Bounded, so that a stuck inspection or store cannot keep the
             # worker, which holds the session's credentials: a send that
@@ -279,6 +280,8 @@ class _Finish:
     final: bool = False  # every event of the monitor is recorded
     # Set when the worker records an event or finishes, to wake an idle delivery.
     wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set with final, to cut a retry's backoff short once.
+    ended: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Finish) -> None:
@@ -364,6 +367,10 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
 
     try:
         while True:
+            # An exit that a check confirmed meanwhile ends delivery before the
+            # next read of the store, once no receipt waits to be written.
+            if not unsettled and exit_confirmed():
+                return
             final = finish.final
             finish.wake.clear()  # before the drain, so that an event during it wakes the wait
             try:
@@ -376,11 +383,13 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
                 # events wait for monitor_events.
                 return
             if result != "idle":
-                # A check that confirmed the owner's exit meanwhile ends delivery,
-                # once no receipt waits to be written.
-                if not unsettled and exit_confirmed():
-                    return
-                await asyncio.sleep(1)
+                if not final:
+                    # Back off, but go at once when the worker finishes, so that
+                    # its last notice gets the time left before the deadline.
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(finish.ended.wait(), timeout=1)
+                else:
+                    await asyncio.sleep(1)
                 continue
             # Idle: wait for an event that this worker records, or its end, which
             # starts the next drain at once. (Only the worker records events
