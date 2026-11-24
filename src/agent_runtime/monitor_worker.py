@@ -313,11 +313,15 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
     def drain() -> str:
         """Send the pending batches: "idle" when none is left, "gone" when the
         owner process has exited, "closed" when the deadline passed, "retry"
-        to try again later. A scan that does not find the lock held only delays
-        a send: only the end of the owner's process ends delivery."""
-        while unsettled:
-            monitors.settle(*unsettled[0])
-            unsettled.pop(0)
+        to try again later, "settled" after writing a receipt that an earlier
+        drain could not (so that a confirmed exit is seen before more work). A
+        scan that does not find the lock held only delays a send: only the end
+        of the owner's process ends delivery."""
+        if unsettled:
+            while unsettled:
+                monitors.settle(*unsettled[0])
+                unsettled.pop(0)
+            return "settled"
         while True:
             if late():  # before a read of the store or an inspection, which can wait
                 return "closed"
@@ -378,6 +382,8 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             except Exception as error:  # a store error: report it and try again
                 print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
                 result = "retry"
+            if result == "settled":
+                continue
             if result == "gone" or (final and (result != "retry" or late())):
                 # Nothing can wake a conversation whose process has exited; the
                 # events wait for monitor_events.
@@ -386,8 +392,11 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
                 if not final:
                     # Back off, but go at once when the worker finishes, so that
                     # its last notice gets the time left before the deadline.
+                    # asyncio.timeout, not wait_for: on Python 3.11, wait_for can
+                    # swallow a cancellation that comes with the event.
                     with suppress(TimeoutError):
-                        await asyncio.wait_for(finish.ended.wait(), timeout=1)
+                        async with asyncio.timeout(1):
+                            await finish.ended.wait()
                 else:
                     await asyncio.sleep(1)
                 continue

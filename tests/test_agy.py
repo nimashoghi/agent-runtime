@@ -942,12 +942,14 @@ def test_an_interrupted_start_leaves_its_replacement_alone(monkeypatch, registry
     # The abandoned thread waits before its ownership check until the
     # replacement runs, so that it finds the replacement under its key.
     gate = threading.Event()
+    arrived = threading.Event()
     runs = []
     original = kind._run
 
     def gated(self, *args):
         runs.append(self)
         if len(runs) == 1:
+            arrived.set()
             gate.wait(5)
         return original(self, *args)
 
@@ -973,6 +975,7 @@ def test_an_interrupted_start_leaves_its_replacement_alone(monkeypatch, registry
     monkeypatch.setattr(threading.Thread, "start", start)
     (first,) = abandoned
     assert not entries
+    assert arrived.wait(5)  # the abandoned thread waits at the gate
     retry = threading.Thread(target=begin, daemon=True)
     retry.start()
     try:
@@ -1196,10 +1199,10 @@ def test_the_end_of_the_worker_cuts_a_retry_backoff_short(tmp_path, monkeypatch)
     sent = []
 
     def scan(*_):
-        # The first scan misses the lock; it is held again right after.
-        first = not scanned.is_set()
+        # Every scan misses the lock until the worker has finished: only a
+        # drain after the end, before the deadline, can send.
         scanned.set()
-        return None if first else True
+        return True if finish.final else None
 
     monkeypatch.setattr(monitor_worker, "agy_alive", scan)
     monkeypatch.setattr(monitor_worker, "lifetime_alive", lambda *_: True)
@@ -1216,8 +1219,11 @@ def test_the_end_of_the_worker_cuts_a_retry_backoff_short(tmp_path, monkeypatch)
         delivery = asyncio.ensure_future(
             monitor_worker._deliver(monitors, "mback", record["owner"], finish)
         )
-        while not scanned.is_set():
+        for _ in range(200):
+            if scanned.is_set():
+                break
             await asyncio.sleep(0.01)
+        assert scanned.is_set()
         # The worker finishes with less time left than one backoff.
         finish.deadline, finish.final = time.monotonic() + 0.5, True
         finish.ended.set()
@@ -1226,3 +1232,36 @@ def test_the_end_of_the_worker_cuts_a_retry_backoff_short(tmp_path, monkeypatch)
 
     asyncio.run(scenario())
     assert sent == ["c1"]
+
+
+def test_a_cancelled_delivery_ends_even_when_the_worker_ends_with_it(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = _delivery_record(monitors, "mcancel")
+    monitors.append("mcancel", "one")
+    scanned = threading.Event()
+
+    def scan(*_):
+        scanned.set()
+        return None  # every send waits: the delivery backs off
+
+    monkeypatch.setattr(monitor_worker, "agy_alive", scan)
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", lambda *_: True)
+    finish = monitor_worker._Finish()
+
+    async def scenario():
+        delivery = asyncio.ensure_future(
+            monitor_worker._deliver(monitors, "mcancel", record["owner"], finish)
+        )
+        for _ in range(200):
+            if scanned.is_set():
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # in its backoff
+        # run() ends the worker and cancels the delivery at the same moment.
+        finish.final = True
+        finish.ended.set()
+        delivery.cancel()
+        await asyncio.wait({delivery}, timeout=2)
+        assert delivery.cancelled()
+
+    asyncio.run(scenario())
