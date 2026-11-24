@@ -16,7 +16,7 @@ from typing import Any
 from agent_runtime import agy
 from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
-from agent_runtime.processes import lifetime_alive
+from agent_runtime.processes import boot_id, lifetime_alive
 from agent_runtime.sessions import Provider, Registry, current_identity, permission_class
 
 
@@ -27,6 +27,37 @@ def owner_key(provider: Provider, session_id: str) -> str:
     are prefixed, so that equal session IDs of two hosts never share monitors.
     """
     return session_id if provider == "claude_code" else f"{provider}:{session_id}"
+
+
+DID_NOT_START = "monitor worker did not start"
+
+
+def _start_mark() -> dict[str, Any]:
+    """When a monitor started, on the monotonic clock of this boot."""
+    try:
+        boot = boot_id()
+    except OSError:
+        boot = None
+    return {"boot": boot, "monotonic": time.monotonic()}
+
+
+def _start_overdue(value: dict[str, Any]) -> bool:
+    """Whether a monitor's worker had its 60 seconds to record itself.
+
+    Measured on the monotonic clock of the boot that started it, which a step
+    of the calendar clock does not move; after another boot no worker of it
+    runs. A record of an earlier version, or one without a boot ID, uses the
+    calendar clock.
+    """
+    started = value.get("started") or {}
+    if started.get("boot") is not None:
+        try:
+            boot = boot_id()
+        except OSError:
+            boot = None
+        if boot is not None:
+            return boot != started["boot"] or time.monotonic() - started["monotonic"] > 60
+    return time.time() - value["created_at"] > 60
 
 
 def _worker_alive(value: dict[str, Any]) -> bool:
@@ -74,12 +105,8 @@ class Monitors:
             # (also its final notice, after the command's outcome) leaves its
             # batch neither sent nor pending. Repeating this changes nothing.
             self.interrupted_delivery(value["session_id"], monitor_id=monitor_id)
-        if (
-            value["status"] == "starting"
-            and not value.get("pid")
-            and time.time() - value["created_at"] > 60
-        ):
-            value = self._interrupt(monitor_id, None, error="monitor worker did not start")
+        if value["status"] == "starting" and not value.get("pid") and _start_overdue(value):
+            value = self._interrupt(monitor_id, None, error=DID_NOT_START)
         return value
 
     def _interrupt(
@@ -117,6 +144,13 @@ class Monitors:
             value = json.loads(row[0])
             if value["status"] != "starting":
                 return None
+            if _start_overdue(value):
+                # Readers may already have reported this; a late worker never runs.
+                value.update(status="interrupted", error=DID_NOT_START, updated_at=time.time())
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
+                return None
             judged = "start_token" in lifetime or (
                 "start_token" not in value["owner"] and "process_created_at" in lifetime
             )
@@ -140,6 +174,19 @@ class Monitors:
             value.update(status="running", **lifetime, updated_at=time.time())
             db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
         return value
+
+    def finish(self, monitor_id: str, text: str, **fields: Any) -> None:
+        """Record the monitor's outcome and its event in one transaction."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = {**json.loads(row[0]), **fields, "updated_at": time.time()}
+            db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
+            db.execute(
+                "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+                "VALUES(?,?,?,'pending',?)",
+                (monitor_id, value["session_id"], text, time.time()),
+            )
 
     def update(self, monitor_id: str, **fields: Any) -> dict[str, Any]:
         with self.store.connect() as db:
@@ -225,6 +272,7 @@ class Monitors:
             "persistent": persistent,
             "status": "starting",
             "created_at": time.time(),
+            "started": _start_mark(),
             "permission_class": mode,
             "owner": owner,
         }
@@ -253,7 +301,10 @@ class Monitors:
                     # variable, user site or working folder may choose its code.
                     *(["-I"] if provider == "agy" else []),
                     "-m",
-                    "agent_runtime.monitor_worker",
+                    # agent-runtime 0.2 has no agy worker, whose command gets no credentials.
+                    "agent_runtime.agy_monitor_worker"
+                    if provider == "agy"
+                    else "agent_runtime.monitor_worker",
                     str(self.store.root),
                     identity,
                 ],

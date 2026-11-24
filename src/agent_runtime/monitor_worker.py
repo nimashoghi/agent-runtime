@@ -40,15 +40,19 @@ async def run(directory: Path, identity: str) -> None:
     # An inherited SIG_IGN would let the kernel discard the command's exit status.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     monitors = Monitors(directory)
-    process = psutil.Process()
     # What readers judge the worker by; begin() fails a worker that they cannot judge.
-    lifetime: dict[str, object] = {"pid": process.pid}
+    lifetime: dict[str, object] = {"pid": os.getpid()}
+    process = None
     with suppress(psutil.Error, OSError):
-        lifetime["process_created_at"] = process.create_time()
-    with suppress(psutil.Error, OSError):
-        lifetime["start_token"] = start_token(process)
+        process = psutil.Process()
+    if process is not None:
+        with suppress(psutil.Error, OSError):
+            lifetime["process_created_at"] = process.create_time()
+        with suppress(psutil.Error, OSError):
+            lifetime["start_token"] = start_token(process)
     if (value := monitors.begin(identity, **lifetime)) is None:
         return  # given up, or failed before this worker started
+    assert process is not None  # begin() accepted an identity read from it
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
@@ -181,13 +185,18 @@ async def run(directory: Path, identity: str) -> None:
             if child.returncode == 0
             else "failed"
         )
-        monitors.update(identity, status=status, exit_code=child.returncode)
-        monitors.append(identity, f"Monitor {identity} {status} (exit code {child.returncode}).")
+        monitors.finish(
+            identity,
+            f"Monitor {identity} {status} (exit code {child.returncode}).",
+            status=status,
+            exit_code=child.returncode,
+        )
     except Exception as error:
         if finish.deadline is None:
             finish.deadline = time.monotonic() + FINAL_DELIVERY
-        monitors.update(identity, status="failed", error=str(error))
-        monitors.append(identity, f"Monitor {identity} failed: {error}")
+        monitors.finish(
+            identity, f"Monitor {identity} failed: {error}", status="failed", error=str(error)
+        )
         raise
     finally:
         if watcher is not None:

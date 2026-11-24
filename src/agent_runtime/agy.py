@@ -54,14 +54,16 @@ def native_process(session_id: str) -> Owner:
             raise RuntimeError(f"cannot identify ancestor {parent_pid} of this process") from None
         links.append((child_pid, parent_pid, token))
         try:
-            held = holds(parent, lock)
+            held = holds(parent_pid, lock)
             if held and parent.uids().real != os.getuid():
                 raise RuntimeError("native agy process belongs to a different user")
-        except psutil.AccessDenied:
+        except (psutil.AccessDenied, PermissionError):
             hidden.append(parent_pid)
             held = False
-        except psutil.NoSuchProcess:
+        except (psutil.NoSuchProcess, FileNotFoundError, ProcessLookupError):
             break
+        except OSError as error:
+            raise RuntimeError(f"cannot inspect ancestor {parent_pid}: {error}") from error
         if held:
             try:
                 intact = all(
@@ -127,36 +129,63 @@ def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> 
             return
 
 
+class _Inspection:
+    """One inspection of an agy process, shared by every discovery that asks
+    while it runs."""
+
+    def __init__(self, key: tuple[int, str, str]) -> None:
+        self.result: bool | None = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=key, daemon=True)
+
+    def _run(self, pid: int, token: str, session_id: str) -> None:
+        try:
+            self.result = agy_alive(pid, token, session_id)
+        except Exception:  # unknown
+            self.result = None
+        finally:
+            self.done.set()
+            with _INSPECTIONS_LOCK:
+                _INSPECTIONS.pop((pid, token, session_id), None)
+
+
+# Inspections that run, at most _MAX_INSPECTIONS, so that discoveries that a
+# stalled file system holds up do not pile up threads.
+_INSPECTIONS: dict[tuple[int, str, str], _Inspection] = {}
+_INSPECTIONS_LOCK = threading.Lock()
+_MAX_INSPECTIONS = 32
+
+
 def live_sessions(
     registry: Registry | None = None, *, timeout: float = 2.0
 ) -> list[dict[str, Any]]:
     """The registered agy sessions whose agy process still holds the conversation.
 
-    Each process is inspected in a daemon thread, and an inspection that has
-    not ended after the timeout (a stalled file system) counts as unknown and
-    leaves its session out, so that it cannot hold up discovery of the others.
+    Each process is inspected in a daemon thread, which a later discovery shares
+    while it runs. An inspection that has not ended by the deadline (a stalled
+    file system), or that did not start because too many run, counts as unknown
+    and leaves only its session out.
     """
+    deadline = time.monotonic() + timeout
     with (registry or Registry()).store.connect() as db:
         rows = db.execute("SELECT value FROM sessions WHERE provider='agy'").fetchall()
     records = [json.loads(row[0]) for row in rows]
-    alive: dict[int, bool | None] = {}
-
-    def inspect(index: int, record: dict[str, Any]) -> None:
-        with contextlib.suppress(Exception):
-            alive[index] = agy_alive(
-                record.get("pid", 0), record.get("native_start", ""), record["session_id"]
-            )
-
-    threads = [
-        threading.Thread(target=inspect, args=(index, record), daemon=True)
-        for index, record in enumerate(records)
-    ]
-    for thread in threads:
-        thread.start()
-    deadline = time.monotonic() + timeout
-    for thread in threads:
-        thread.join(max(0.0, deadline - time.monotonic()))
-    return [record for index, record in enumerate(records) if alive.get(index) is True]
+    inspections: list[_Inspection | None] = []
+    for record in records:
+        key = (record.get("pid", 0), record.get("native_start", ""), record["session_id"])
+        with _INSPECTIONS_LOCK:
+            if (inspection := _INSPECTIONS.get(key)) is None and len(
+                _INSPECTIONS
+            ) < _MAX_INSPECTIONS:
+                inspection = _INSPECTIONS[key] = _Inspection(key)
+                inspection.thread.start()
+        inspections.append(inspection)
+    live = []
+    for record, inspection in zip(records, inspections, strict=True):
+        remaining = max(0.0, deadline - time.monotonic())
+        if inspection is not None and inspection.done.wait(remaining) and inspection.result:
+            live.append(record)
+    return live
 
 
 def notice(session_id: str, events: list[dict[str, Any]]) -> str:

@@ -16,15 +16,23 @@ from agent_runtime.claude import process_alive
 AGY_CONVERSATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 
 
-def _boot() -> str:
-    """This boot of the machine on Linux, so that a start token never repeats
-    across restarts; elsewhere the start is calendar time, which does not. An
-    unreadable boot ID raises, so that no token is made without it."""
-    if not sys.platform.startswith("linux"):
-        return ""
-    if not (boot := Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
+def boot_id() -> str:
+    """This boot of the machine: the boot ID on Linux, the boot session UUID on
+    macOS. Raises OSError when it cannot be read."""
+    if sys.platform.startswith("linux"):
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    elif sys.platform == "darwin":
+        boot = _sysctl_text(b"kern.bootsessionuuid")
+    else:
+        raise OSError(f"no boot ID on {sys.platform}")
+    if not boot:
         raise OSError("the boot ID is empty")
-    return boot + ":"
+    return boot
+
+
+def _boot() -> str:
+    # The boot, so that a start token never repeats across restarts.
+    return boot_id() + ":"
 
 
 def start_token(process: psutil.Process) -> str:
@@ -33,7 +41,8 @@ def start_token(process: psutil.Process) -> str:
     This is psutil's own identity of a process lifetime (``Process._get_ident``,
     psutil 7.1 and newer): the start that the kernel recorded, without the
     adjustment to the current clock that the public create_time() makes, so a
-    clock step leaves it alone.
+    clock step leaves it alone. The boot comes first, so that it never repeats
+    across restarts.
     """
     platform_process = getattr(process, "_proc")  # noqa: B009 - psutil's private handle
     return _boot() + repr(platform_process.create_time(monotonic=True))
@@ -65,8 +74,13 @@ def presence_lock(session_id: str) -> Path:
 
 
 if sys.platform == "darwin":
-    # sys/proc_info.h: proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO) gives the device
-    # and inode of another process's open file, which psutil does not.
+    # sys/proc_info.h and libproc: the descriptors of another process, and the
+    # device and inode of each open file, which psutil does not give. ctypes
+    # releases the GIL during each call, so a stalled file system holds up only
+    # the thread that inspects.
+    class _ProcFdInfo(ctypes.Structure):
+        _fields_ = [("proc_fd", ctypes.c_int32), ("proc_fdtype", ctypes.c_uint32)]
+
     class _VinfoStat(ctypes.Structure):
         _fields_ = [
             ("vst_dev", ctypes.c_uint32),
@@ -105,6 +119,14 @@ if sys.platform == "darwin":
         ]
 
     _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    _LIBPROC.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    _LIBPROC.proc_pidinfo.restype = ctypes.c_int
     _LIBPROC.proc_pidfdinfo.argtypes = [
         ctypes.c_int,
         ctypes.c_int,
@@ -113,7 +135,53 @@ if sys.platform == "darwin":
         ctypes.c_int,
     ]
     _LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
+    _PROC_PIDLISTFDS = 1
+    _PROX_FDTYPE_VNODE = 1
     _PROC_PIDFDVNODEPATHINFO = 2
+
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _LIBC.sysctlbyname.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    _LIBC.sysctlbyname.restype = ctypes.c_int
+
+
+def _failed() -> OSError:
+    error = ctypes.get_errno()
+    return OSError(error, os.strerror(error))
+
+
+def _sysctl_text(name: bytes) -> str:
+    size = ctypes.c_size_t(128)
+    value = ctypes.create_string_buffer(size.value)
+    if _LIBC.sysctlbyname(name, value, ctypes.byref(size), None, 0) != 0:
+        raise _failed()
+    return value.value.decode()
+
+
+def _descriptors(pid: int) -> list[int]:
+    """The open file descriptors of a process (on macOS, those of files)."""
+    if sys.platform.startswith("linux"):
+        return [int(name) for name in os.listdir(f"/proc/{pid}/fd")]
+    if sys.platform == "darwin":
+        record = ctypes.sizeof(_ProcFdInfo)
+        if (estimate := _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)) <= 0:
+            raise _failed()
+        listing = (_ProcFdInfo * (estimate // record + 32))()  # room for new descriptors
+        if (
+            size := _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, listing, ctypes.sizeof(listing))
+        ) <= 0:
+            raise _failed()
+        return [
+            item.proc_fd
+            for item in listing[: size // record]
+            if item.proc_fdtype == _PROX_FDTYPE_VNODE
+        ]
+    raise OSError(f"agy sessions need Linux or macOS, not {sys.platform}")
 
 
 def _descriptor_file(pid: int, fd: int) -> tuple[int, int] | None:
@@ -132,11 +200,11 @@ def _descriptor_file(pid: int, fd: int) -> tuple[int, int] | None:
             _LIBPROC.proc_pidfdinfo(pid, fd, _PROC_PIDFDVNODEPATHINFO, ctypes.byref(info), size)
             != size
         ):
-            if (error := ctypes.get_errno()) == errno.EBADF:
+            if ctypes.get_errno() == errno.EBADF:
                 return None
-            raise OSError(error, os.strerror(error))
+            raise _failed()
         return info.pvip.vi_stat.vst_dev, info.pvip.vi_stat.vst_ino
-    raise NotImplementedError(f"agy sessions need Linux or macOS, not {sys.platform}")
+    raise OSError(f"agy sessions need Linux or macOS, not {sys.platform}")
 
 
 def _named_file(path: Path) -> tuple[int, int] | None:
@@ -151,40 +219,35 @@ def _named_file(path: Path) -> tuple[int, int] | None:
     return device, status.st_ino
 
 
-def holds(process: psutil.Process, lock: Path) -> bool:
+def holds(pid: int, lock: Path) -> bool:
     """Whether the process has the file that the lock's name identifies open.
 
-    psutil names an open file that was replaced at its path, and that a process
-    still holds open, by that path, so the open file must also be the same file
-    (device and inode) as the one that the name identifies after the scan: a
-    replacement before or during the scan does not count.
+    The open file must be the same file (device and inode), so that a lock that
+    agy replaced does not count for an old process that still has the old file
+    open. Raises OSError when it cannot tell, also when the name identified
+    another file after the scan than before it. Every call releases the GIL.
     """
-    target = lock.resolve()
-    opened = set()
-    for file in process.open_files():
-        if Path(file.path).resolve() == target and (
-            identity := _descriptor_file(process.pid, file.fd)
-        ):
-            opened.add(identity)
-    return bool(opened) and _named_file(lock) in opened
+    if (named := _named_file(lock)) is None:
+        return False
+    opened = {identity for fd in _descriptors(pid) if (identity := _descriptor_file(pid, fd))}
+    if _named_file(lock) != named:
+        raise OSError(errno.EAGAIN, "the presence lock changed during the scan")
+    return named in opened
 
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
     """Whether the agy process of this lifetime still holds the conversation;
-    None when this process may not inspect it. The lifetime is checked again
-    after the open files, with a fresh look, so a PID that changed hands in
-    between does not count."""
+    None when this process cannot tell. The lifetime is checked again after the
+    scan, so a PID that changed hands meanwhile does not count."""
     if (first := lifetime_alive(pid, token)) is not True:
         return first
     try:
-        held = holds(psutil.Process(pid), presence_lock(session_id))
-    except psutil.NoSuchProcess:
-        return False
-    except (psutil.AccessDenied, OSError, RuntimeError):  # RuntimeError: a symlink loop
-        return None
-    if not held:
-        return False
-    return lifetime_alive(pid, token)
+        held: bool | None = holds(pid, presence_lock(session_id))
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop
+        held = None
+    if (then := lifetime_alive(pid, token)) is not True:
+        return then
+    return held
 
 
 def owner_alive(owner: dict) -> bool:

@@ -1,10 +1,12 @@
 """agy sessions against a stand-in agy process and a recording agentapi."""
 
 import asyncio
+import errno
 import itertools
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -14,7 +16,7 @@ from contextlib import suppress
 import psutil
 import pytest
 
-from agent_runtime import monitor_worker, operations
+from agent_runtime import monitor_worker, operations, processes
 from agent_runtime.hooks import app
 from agent_runtime.monitors import Monitors
 from agent_runtime.processes import holds, lifetime_alive, start_token
@@ -287,6 +289,8 @@ def test_a_worker_that_dies_while_sending_leaves_its_batch_uncertain(conversatio
     record = monitors.get(monitor["monitor_id"])
     worker = psutil.Process(record["pid"])
     assert start_token(worker) == record["start_token"]
+    # The agy worker module, which agent-runtime 0.2 does not have.
+    assert "agent_runtime.agy_monitor_worker" in worker.cmdline()
     stragglers = worker.children(recursive=True)
     try:
         worker.kill()
@@ -486,8 +490,8 @@ def test_the_public_operations_of_an_agy_session(conversation):
     assert stopped["stop_requested"] is True
 
 
-@pytest.mark.parametrize("during_scan", [False, True])
-def test_an_old_process_does_not_hold_a_replaced_presence_lock(tmp_path, during_scan):
+@pytest.mark.parametrize("when", ["before", "during"])
+def test_an_old_process_does_not_hold_a_replaced_presence_lock(tmp_path, monkeypatch, when):
     lock = tmp_path / "conversation.lock"
     lock.touch()
 
@@ -496,24 +500,56 @@ def test_an_old_process_does_not_hold_a_replaced_presence_lock(tmp_path, during_
         lock.touch()
 
     with lock.open():
-        process = psutil.Process()
-        assert holds(process, lock)
-
-        class Scanning:
-            """The lock is replaced while the open files are read."""
-
-            pid = process.pid
-
-            def open_files(self):
-                files = process.open_files()
-                replace()
-                return files
-
-        if during_scan:
-            assert not holds(Scanning(), lock)  # pyright: ignore[reportArgumentType]
-        else:
+        assert holds(os.getpid(), lock)
+        if when == "before":
             replace()
-            assert not holds(process, lock)
+            assert not holds(os.getpid(), lock)
+        else:
+            # Replaced while the descriptors are read: the answer is unknown.
+            listing = processes._descriptors
+
+            def replacing(pid):
+                found = listing(pid)
+                replace()
+                return found
+
+            monkeypatch.setattr(processes, "_descriptors", replacing)
+            with pytest.raises(OSError, match="changed during the scan"):
+                holds(os.getpid(), lock)
+
+
+def test_an_unreadable_presence_lock_leaves_the_owner_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock = processes.presence_lock("c1")
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    token = start_token(psutil.Process())
+    with lock.open():
+        assert processes.agy_alive(os.getpid(), token, "c1") is True
+
+        def unreadable(_path):
+            raise OSError(errno.EIO, "input/output error")
+
+        monkeypatch.setattr(processes, "_named_file", unreadable)
+        assert processes.agy_alive(os.getpid(), token, "c1") is None
+
+
+def test_a_monitor_is_not_given_up_after_a_step_of_the_calendar_clock(tmp_path):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mstep",
+        "session_id": "agy:c1",
+        "status": "starting",
+        # The calendar clock stepped 90 s forward right after the start.
+        "created_at": time.time() - 90,
+        "started": {"boot": processes.boot_id(), "monotonic": time.monotonic()},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mstep", "agy:c1", json.dumps(record)))
+    assert monitors.get("mstep")["status"] == "starting"
+    begun = monitors.begin("mstep", pid=os.getpid(), process_created_at=1.0, start_token="w")
+    assert begun is not None and begun["status"] == "running"
 
 
 def test_an_agy_worker_without_a_start_token_fails_before_it_runs(tmp_path, monkeypatch):
@@ -533,7 +569,12 @@ def test_an_agy_worker_without_a_start_token_fails_before_it_runs(tmp_path, monk
 
     monkeypatch.setattr(monitor_worker, "start_token", denied)
 
-    asyncio.run(monitor_worker.run(tmp_path, "magy"))
+    # run() sets the process's SIGCHLD disposition; the test runner keeps its own.
+    disposition = signal.getsignal(signal.SIGCHLD)
+    try:
+        asyncio.run(monitor_worker.run(tmp_path, "magy"))
+    finally:
+        signal.signal(signal.SIGCHLD, disposition)
 
     failed = monitors.get("magy")
     reason = "the monitor worker cannot read its own process identity"
