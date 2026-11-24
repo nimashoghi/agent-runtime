@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -61,7 +62,28 @@ def presence_lock(session_id: str) -> Path:
 
 
 def holds(process: psutil.Process, lock: Path) -> bool:
-    return any(Path(file.path).resolve() == lock for file in process.open_files())
+    """Whether the process has the conversation's current lock file open.
+
+    On Linux the open file must also be the lock's current inode: psutil names a
+    lock that was replaced, and that an old process still holds open, by its
+    old path.
+    """
+    try:
+        current = lock.stat()
+    except FileNotFoundError:
+        return False
+    for file in process.open_files():
+        if Path(file.path).resolve() != lock:
+            continue
+        if not sys.platform.startswith("linux"):
+            return True
+        try:
+            opened = os.stat(f"/proc/{process.pid}/fd/{file.fd}")
+        except FileNotFoundError:  # closed meanwhile
+            continue
+        if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+            return True
+    return False
 
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:

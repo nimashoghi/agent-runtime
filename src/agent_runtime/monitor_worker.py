@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
@@ -42,16 +43,29 @@ async def run(directory: Path, identity: str) -> None:
         lifetime["start_token"] = start_token(process)
     if (value := monitors.begin(identity, **lifetime)) is None:
         return  # given up or failed before this worker started
+    if "start_token" in value["owner"] and "start_token" not in lifetime:
+        # Readers judge an agy worker by its token, as the worker judges its owner.
+        monitors.update(identity, status="failed", error="the worker cannot read its start token")
+        return
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
     owner = value["owner"]
-    finish_by: list[float] = []  # the final delivery deadline, once the command ended
+    finish = _Finish()
     delivery = None
     if "start_token" in owner:
         # The worker of an agy monitor delivers its own events with the
         # credentials of the command that started it; nothing else claims them.
-        delivery = asyncio.create_task(_deliver(monitors, identity, owner, finish_by))
+        delivery = asyncio.create_task(_deliver(monitors, identity, owner, finish))
+
+    async def watch_owner() -> None:
+        # In its own task, because inspecting an agy owner's open files can be
+        # slow, and supervision must go on meanwhile.
+        while await asyncio.to_thread(owner_alive, owner):
+            await asyncio.sleep(0.25)
+        stop.set()
+
+    watcher = None if value["persistent"] else asyncio.create_task(watch_owner())
     child = None
     child_created = None
     descendants = {}
@@ -123,7 +137,7 @@ async def run(directory: Path, identity: str) -> None:
             if not value["persistent"] and time.monotonic() - started >= value["timeout_ms"] / 1000:
                 timed_out = True
                 stop.set()
-            if state.get("stop_requested") or (not value["persistent"] and not owner_alive(owner)):
+            if state.get("stop_requested"):
                 stop.set()
             if stop.is_set():
                 if process_alive({"pid": child.pid, "process_created_at": child_created}):
@@ -137,6 +151,7 @@ async def run(directory: Path, identity: str) -> None:
                 if reader.done() and (error := reader.exception()) is not None:
                     raise error
             await asyncio.sleep(0.1)
+        finish.deadline = time.monotonic() + FINAL_DELIVERY
         # Stop can win the race with a normal exit; record the exit code then too.
         await exited(child, 5)
         try:
@@ -162,6 +177,8 @@ async def run(directory: Path, identity: str) -> None:
         monitors.append(identity, f"Monitor {identity} failed: {error}")
         raise
     finally:
+        if watcher is not None:
+            watcher.cancel()
         for pid, created in descendants.items():
             if process_alive({"pid": pid, "process_created_at": created}):
                 with suppress(ProcessLookupError):
@@ -174,61 +191,84 @@ async def run(directory: Path, identity: str) -> None:
             reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
         if delivery is not None:
-            # A last pass for the final events. No send starts after its
-            # deadline, and none is cut off.
-            finish_by.append(time.monotonic() + FINAL_DELIVERY)
+            # A last pass for the final events. No send starts after the
+            # deadline, which runs from the command's end, and none is cut off.
+            if finish.deadline is None:
+                finish.deadline = time.monotonic() + FINAL_DELIVERY
+            finish.final = True
             with suppress(Exception):
                 await delivery
 
 
-async def _deliver(monitors: Monitors, identity: str, owner: dict, finish_by: list[float]) -> None:
-    """Notify the agy session of this monitor's events, until finish_by holds a
-    deadline and nothing is left to send or the deadline passed.
+@dataclass
+class _Finish:
+    """When an agy worker's delivery ends."""
+
+    deadline: float | None = None  # no send starts after it
+    final: bool = False  # every event of the monitor is recorded
+
+
+async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Finish) -> None:
+    """Notify the agy session of this monitor's events, until every event is
+    recorded and none is left to send, or the deadline passed.
 
     A batch is sent only while the owner's lifetime is confirmed to hold the
     conversation and the deadline has not passed: before the claim, and again in
     the sending thread right before agentapi starts; otherwise the batch goes
-    back to pending, for monitor_events in the session that resumes it. The
-    store is used from a thread, so that a wait for it never holds up the
-    worker's supervision. A batch's receipt is written in one transaction, and a
-    failed write is retried without sending again.
+    back to pending, for monitor_events. An owner that cannot be inspected is
+    asked again. The store is used from a thread, so that a wait for it never
+    holds up the worker's supervision. A claimed batch gets a receipt in one
+    transaction, also when the send raised (uncertain), and a failed write is
+    retried without sending again.
     """
     conversation = owner["conversation"]
     unsettled: list[tuple[list[int], str, str | None]] = []
 
+    def owner_state() -> bool | None:
+        return agy_alive(owner["pid"], owner["start_token"], conversation)
+
     def late() -> bool:
-        return bool(finish_by) and time.monotonic() > finish_by[0]
+        return finish.deadline is not None and time.monotonic() > finish.deadline
 
     def sendable() -> bool:
-        return not late() and agy_alive(owner["pid"], owner["start_token"], conversation) is True
+        # The clock is read after the inspection, which can be slow.
+        return owner_state() is True and not late()
 
-    def drain() -> bool:
-        """Send the pending batches; True when nothing is left to do for now."""
+    def drain() -> str:
+        """Send the pending batches: "idle" when none is left, "closed" when the
+        owner is gone or the deadline passed, "retry" to try again later."""
         while unsettled:
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
-        while sendable():
+        while True:
+            state = owner_state()
+            if state is False or late():
+                return "closed"
+            if state is None:
+                return "retry"
             if not (events := monitors.claim_monitor(identity)):
-                return True
-            text = agy.notice(conversation, events)
-            status, detail = agy.send_notice(conversation, text, sendable)
+                return "idle"
+            try:
+                text = agy.notice(conversation, events)
+                status, detail = agy.send_notice(conversation, text, sendable)
+            except Exception as error:  # agentapi may have started
+                status, detail = "uncertain", f"delivery failed ({type(error).__name__})"
             unsettled.append(([event["id"] for event in events], status, detail))
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
             if status == "pending":
-                return False
-        return True
+                return "retry"
 
     while True:
-        final = bool(finish_by)
+        final = finish.final
         try:
-            done = await asyncio.to_thread(drain)
+            result = await asyncio.to_thread(drain)
         except Exception as error:  # a store error: report it and try again
             print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
-            done = False
-        if final and (done or late()):
+            result = "retry"
+        if final and (result != "retry" or late()):
             return
-        await asyncio.sleep(0.2 if done else 1)
+        await asyncio.sleep(0.2 if result == "idle" else 1)
 
 
 if __name__ == "__main__":

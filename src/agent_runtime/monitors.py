@@ -317,9 +317,34 @@ class Monitors:
                 "UPDATE monitor_events SET status=?,error=? WHERE id=?", (status, error, identity)
             )
 
+    def reconcile_deliveries(self, session_id: str) -> None:
+        """Read each monitor of the session that has a batch being sent, so that
+        the batch of a worker that died shows as uncertain."""
+        with self.store.connect() as db:
+            identities = [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT monitor_id FROM monitor_events "
+                    "WHERE session_id=? AND status='dispatching'",
+                    (session_id,),
+                )
+            ]
+        for identity in identities:
+            self.get(identity)
+
     def interrupted_delivery(self, session_id: str, *, monitor_id: str | None = None) -> None:
         """Mark the events that a delivery that ended left dispatching uncertain."""
         with self.store.connect() as db:
+            # A read first, so that a monitor without such events takes no write lock.
+            if (
+                db.execute(
+                    "SELECT 1 FROM monitor_events WHERE session_id=? AND status='dispatching' "
+                    "AND (? IS NULL OR monitor_id=?) LIMIT 1",
+                    (session_id, monitor_id, monitor_id),
+                ).fetchone()
+                is None
+            ):
+                return
             db.execute(
                 "UPDATE monitor_events SET status='uncertain',"
                 "error='delivery exited during a delivery attempt' "

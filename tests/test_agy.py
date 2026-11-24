@@ -246,12 +246,7 @@ def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
     # The worker, which held the credentials, ends with its command.
     worker = Monitors(agy.state).get(monitor["monitor_id"])
     assert worker["status"] == "completed"
-    wait_for(
-        lambda: (
-            not psutil.pid_exists(worker["pid"])
-            or psutil.Process(worker["pid"]).status() == psutil.STATUS_ZOMBIE
-        )
-    )
+    wait_for(lambda: lifetime_alive(worker["pid"], worker["start_token"]) is False)
 
 
 def test_a_persistent_monitor_keeps_its_output_for_the_resumed_session(conversation):
@@ -293,6 +288,36 @@ def test_a_worker_that_dies_while_sending_leaves_its_batch_uncertain(conversatio
         (event,) = agy.events()
         assert (event["text"], event["status"]) == ("one", "uncertain")
         assert event["error"] == "delivery exited during a delivery attempt"
+    finally:
+        (agy.tmp / "agentapi.jsonl.release").touch()
+        for process in stragglers:
+            with suppress(psutil.NoSuchProcess):
+                process.kill()
+
+
+def test_a_worker_that_dies_during_its_completion_notice_keeps_the_outcome(conversation):
+    agy = conversation
+    (agy.tmp / "agentapi.jsonl.block").touch()
+    _process, monitor = agy.run({"name": "start", "command": "true"})
+    monitors = Monitors(agy.state)
+    # The only event is the completion notice, sent after the outcome is recorded.
+    wait_for((agy.tmp / "agentapi.jsonl.started").exists)
+    record = monitors.get(monitor["monitor_id"])
+    assert record["status"] == "completed"
+    worker = psutil.Process(record["pid"])
+    assert start_token(worker) == record["start_token"]
+    stragglers = worker.children(recursive=True)
+    try:
+        worker.kill()
+        wait_for(lambda: lifetime_alive(record["pid"], record["start_token"]) is False)
+        _process, events = agy.run({"name": "events"})
+        (event,) = events
+        assert event["text"].startswith(f"Monitor {monitor['monitor_id']} completed")
+        assert (event["status"], event["error"]) == (
+            "uncertain",
+            "delivery exited during a delivery attempt",
+        )
+        assert monitors.get(monitor["monitor_id"])["status"] == "completed"
     finally:
         (agy.tmp / "agentapi.jsonl.release").touch()
         for process in stragglers:

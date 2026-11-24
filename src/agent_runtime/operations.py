@@ -104,9 +104,9 @@ def monitor_events(*, after: int = 0) -> list[dict[str, Any]]:
     monitors = Monitors()
     key = owner_key(provider, session_id)
     if provider == "agy":
-        # Reading the monitors records an agy worker that died while sending, so
-        # that its batch shows as uncertain here and not as dispatching.
-        monitors.list(key)
+        # So that the batch of an agy worker that died while sending shows as
+        # uncertain here, not as dispatching.
+        monitors.reconcile_deliveries(key)
     return monitors.events(key, after=after)
 
 

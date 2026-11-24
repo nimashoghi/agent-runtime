@@ -8,7 +8,7 @@
 - `current_identity()` raises `AmbiguousIdentity` for an environment that has an agy conversation and a Claude, Codex or managed session, and `IdentityUnavailable` when there is none; both are `RuntimeError`s.
 - `monitor_get` and `monitor_stop` reject another session's monitor before they read its state.
 - `Monitors.claim_monitor(monitor_id)` claims one monitor's events. `agent_runtime.processes` holds a process identity that a step of the clock does not change, which the monitor worker records for itself and `Monitors.get` uses. A monitor worker records its own process when it starts (`Monitors.begin`), and only while the monitor still waits for it; `Monitors.start` writes nothing after the worker starts and returns the new record, whose status is `starting`. An interruption is recorded only when, inside the write transaction, the record still names the same worker and that worker is confirmed gone. The worker also resets an inherited `SIGCHLD` disposition, and fails at once with a reason where the system denies it the list of its child processes.
-- An interrupted delivery records "delivery exited during a delivery attempt".
+- An interrupted delivery records "delivery exited during a delivery attempt". `Monitors.reconcile_deliveries(session_id)` records it for the monitors of a session that have a batch being sent; agy's `monitor_events` calls it.
 - Requires `typed-agent-hooks>=0.4,<0.5` and `psutil>=7.1,<8`.
 
 ## 0.2.4
