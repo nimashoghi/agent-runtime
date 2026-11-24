@@ -7,6 +7,7 @@ import errno
 import os
 import re
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import psutil
@@ -50,6 +51,9 @@ def start_token(process: psutil.Process) -> str:
 
 def lifetime_alive(pid: int, token: str) -> bool | None:
     """Whether the process of this lifetime runs; None when it cannot be inspected."""
+    with suppress(OSError):  # without the boot ID, the process itself tells
+        if token.rpartition(":")[0] != boot_id():
+            return False  # a lifetime of another boot
     try:
         process = psutil.Process(pid)
         # A zombie has exited, whoever's it is; this needs no boot ID.
@@ -279,9 +283,10 @@ def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
 
 
 def owner_alive(owner: dict) -> bool:
-    """Whether a monitor's owner lives: an agy owner by its lifetime and
-    conversation, another by PID and creation time."""
+    """Whether a monitor's owner lives: an agy owner by its lifetime (whether
+    its process still runs, which a scan of open files cannot get wrong),
+    another by PID and creation time."""
     if "start_token" in owner:
         # A process that this one may not inspect counts as alive.
-        return agy_alive(owner["pid"], owner["start_token"], owner["conversation"]) is not False
+        return lifetime_alive(owner["pid"], owner["start_token"]) is not False
     return process_alive(owner)

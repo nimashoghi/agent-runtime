@@ -18,7 +18,7 @@ from agent_runtime import agy
 from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import agy_alive, owner_alive, start_token
+from agent_runtime.processes import agy_alive, lifetime_alive, owner_alive, start_token
 
 # The final delivery pass after the command ends: two agentapi calls.
 FINAL_DELIVERY = 2 * agy.AGENTAPI_TIMEOUT
@@ -300,8 +300,9 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
 
     def drain() -> str:
         """Send the pending batches: "idle" when none is left, "gone" when the
-        owner no longer holds the conversation, "closed" when the deadline
-        passed, "retry" to try again later."""
+        owner process has exited, "closed" when the deadline passed, "retry"
+        to try again later. A scan that does not find the lock held only delays
+        a send: only the end of the owner's process ends delivery."""
         while unsettled:
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
@@ -309,12 +310,11 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             if late():  # before an inspection, which can be slow
                 return "closed"
             state = owner_state()
-            if state is False:
-                return "gone"
             if late():
                 return "closed"
-            if state is None:
-                return "retry"
+            if state is not True:
+                ended = lifetime_alive(owner["pid"], owner["start_token"]) is False
+                return "gone" if ended else "retry"
             if not (events := monitors.claim_monitor(identity)):
                 return "idle"
             try:
@@ -336,7 +336,7 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
             result = "retry"
         if result == "gone" or (final and (result != "retry" or late())):
-            # Nothing can wake a conversation that its process left; the
+            # Nothing can wake a conversation whose process has exited; the
             # events wait for monitor_events.
             return
         await asyncio.sleep(0.2 if result == "idle" else 1)

@@ -89,6 +89,31 @@ def native_process(session_id: str) -> Owner:
 OWNER_TIMEOUT = 10
 
 
+class _Lookup:
+    """One search for the agy process of this process's conversation."""
+
+    def __init__(self, session_id: str) -> None:
+        self.owner: Owner | None = None
+        self.error: BaseException | None = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(session_id,), daemon=True)
+
+    def _run(self, session_id: str) -> None:
+        try:
+            self.owner = native_process(session_id)
+        except BaseException as error:  # handed to the callers
+            self.error = error
+        finally:
+            self.done.set()
+            with _LOOKUPS_LOCK:
+                _LOOKUPS.pop(session_id, None)
+
+
+_LOOKUPS: dict[str, _Lookup] = {}
+_LOOKUPS_LOCK = threading.Lock()
+_MAX_LOOKUPS = 4
+
+
 def command_owner(session_id: str) -> Owner:
     """The agy process lifetime whose credentials this command holds."""
     if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != agy_conversation(session_id):
@@ -98,27 +123,24 @@ def command_owner(session_id: str) -> Owner:
             f"agy message credentials are unavailable ({', '.join(missing)}); "
             "start agy monitors from a command of the agy session"
         )
-    # A stalled file system can hold up the scan of the ancestors' descriptors.
-    found: list[Owner] = []
-    failed: list[BaseException] = []
-
-    def find() -> None:
-        try:
-            found.append(native_process(session_id))
-        except BaseException as error:  # handed to the caller
-            failed.append(error)
-
-    thread = threading.Thread(target=find, daemon=True)
-    thread.start()
-    thread.join(OWNER_TIMEOUT)
-    if failed:
-        raise failed[0]
-    if not found:
+    # A stalled file system can hold up the scan of the ancestors' descriptors:
+    # the scan runs in a daemon thread, which later calls of this process share
+    # while it runs.
+    with _LOOKUPS_LOCK:
+        if (lookup := _LOOKUPS.get(session_id)) is None:
+            if len(_LOOKUPS) >= _MAX_LOOKUPS:
+                raise RuntimeError("earlier searches for agy processes have not ended")
+            lookup = _LOOKUPS[session_id] = _Lookup(session_id)
+            lookup.thread.start()
+    if not lookup.done.wait(OWNER_TIMEOUT):
         raise RuntimeError(
             f"the agy process of this command was not found in {OWNER_TIMEOUT} s; "
             "a file system may not be answering"
         )
-    return found[0]
+    if lookup.error is not None:
+        raise lookup.error
+    assert lookup.owner is not None
+    return lookup.owner
 
 
 def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> None:

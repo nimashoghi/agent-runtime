@@ -128,6 +128,9 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
                 "CLAUDE_CODE_MESSAGING_SOCKET": str(Path(temporary) / "inbox.sock"),
                 "CLAUDE_CODE_MESSAGING_TOKEN": "fixture-token",
                 # A Claude session started from an agy command inherits these.
+                "ANTIGRAVITY_CONVERSATION_ID": "agy-conversation",
+                "ANTIGRAVITY_AGENT": "1",
+                "ANTIGRAVITY_TRAJECTORY_ID": "agy-trajectory",
                 "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
                 "ANTIGRAVITY_CSRF_TOKEN": "agy-token",
                 "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",

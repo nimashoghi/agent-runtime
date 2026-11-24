@@ -38,7 +38,7 @@ import json, subprocess, sys, time
 
 lock = open(sys.argv[1], "a")
 for step in json.load(sys.stdin):
-    subprocess.run(step["argv"], env=step["env"], check=False)
+    subprocess.run(step["argv"], env=step["env"], cwd=step.get("cwd"), check=False)
 time.sleep(300)
 """
 
@@ -166,13 +166,13 @@ class Agy:
         self.results = itertools.count()
         self.state = tmp_path / "state"
 
-    def run(self, op, *, hook=True, token="fixture-token"):
+    def run(self, op, *, hook=True, token="fixture-token", cwd=None):
         """Start an agy process that runs a hook and then one command; return the
         process and the command's result."""
-        process, (result,) = self.run_all([op], hook=hook, token=token)
+        process, (result,) = self.run_all([op], hook=hook, token=token, cwd=cwd)
         return process, result
 
-    def run_all(self, ops, *, hook=True, token="fixture-token"):
+    def run_all(self, ops, *, hook=True, token="fixture-token", cwd=None):
         """Start one agy process that runs a hook and a command for each operation."""
         results = [self.tmp / f"result-{next(self.results)}.json" for _ in ops]
         payload = {
@@ -190,7 +190,7 @@ class Agy:
                 steps.append({"argv": hook_argv, "env": self.hook_env})
             command = [sys.executable, "-c", AGENT, str(result), json.dumps(op)]
             env = {**self.command_env, "ANTIGRAVITY_CSRF_TOKEN": token}
-            steps.append({"argv": command, "env": env})
+            steps.append({"argv": command, "env": env, "cwd": str(cwd) if cwd else None})
         process = subprocess.Popen(
             [sys.executable, "-c", FAKE_AGY, str(self.lock)],
             stdin=subprocess.PIPE,
@@ -688,10 +688,12 @@ def test_a_stop_before_an_expired_start_ends_the_same_either_way(tmp_path, reade
     lifetime = {"pid": os.getpid(), "process_created_at": 1.0, "start_token": "w"}
     if reader_first:
         monitors.get("mlate")
-        monitors.begin("mlate", **lifetime)
+        begun = monitors.begin("mlate", **lifetime)
     else:
-        monitors.begin("mlate", **lifetime)
+        begun = monitors.begin("mlate", **lifetime)
         monitors.get("mlate")
+    # Either way the worker gets the record, to send the stop notice.
+    assert begun is not None and begun["status"] == "stopped"
     assert monitors.get("mlate")["status"] == "stopped"
     assert [event["text"] for event in monitors.events("agy:c1")] == [
         "Monitor mlate stopped before its command started."
@@ -774,6 +776,72 @@ def test_discovery_inspects_every_session_within_its_budget(tmp_path, monkeypatc
     monkeypatch.setattr(agy_module, "agy_alive", slow)
     found = agy_module.live_sessions(registry)
     assert sorted(record["session_id"] for record in found) == sorted(f"c{i}" for i in range(40))
+
+
+def test_only_the_end_of_its_process_ends_an_agy_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = start_token(psutil.Process())
+    owner = {"pid": os.getpid(), "start_token": token, "conversation": "c1"}
+    # No presence lock is held: that delays sends, and does not end the monitor.
+    assert processes.agy_alive(os.getpid(), token, "c1") is False
+    assert processes.owner_alive(owner) is True
+    # A lifetime of another boot has ended, whoever has its PID now.
+    assert processes.lifetime_alive(1, "another-boot:1.0") is False
+
+
+def test_a_launch_failure_after_a_stop_keeps_the_stop(tmp_path):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mkeep",
+        "session_id": "agy:c1",
+        "status": "stopped",
+        "before_start": True,
+        "created_at": time.time(),
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mkeep", "agy:c1", json.dumps(record)))
+    monitors._launch_failed("mkeep", OSError("no worker"))
+    assert monitors.get("mkeep")["status"] == "stopped"
+
+
+def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
+    for name, value in {
+        "ANTIGRAVITY_CONVERSATION_ID": "c2",
+        "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+        "ANTIGRAVITY_CSRF_TOKEN": "fixture-token",
+        "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
+    }.items():
+        monkeypatch.setenv(name, value)
+    release = threading.Event()
+    monkeypatch.setattr(agy_module, "native_process", lambda _session_id: release.wait(5))
+    monkeypatch.setattr(agy_module, "OWNER_TIMEOUT", 0.1)
+    try:
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="was not found"):
+                agy_module.command_owner("c2")
+        assert len(agy_module._LOOKUPS) == 1
+    finally:
+        release.set()
+    wait_for(lambda: not agy_module._LOOKUPS)
+
+
+def test_a_monitor_starts_without_a_hook_record_in_the_command_folder(conversation):
+    agy = conversation
+    folder = agy.tmp / "elsewhere"
+    folder.mkdir()
+    _process, monitor = agy.run({"name": "start", "command": "pwd"}, hook=False, cwd=folder)
+    assert "error" not in monitor
+    with pytest.raises(KeyError, match="has not registered"):
+        Registry(agy.state).get("agy", agy.session_id)
+    events = wait_for(
+        lambda: (
+            len(found := agy.events()) == 2
+            and all(event["status"] == "transport-written" for event in found)
+            and found
+        )
+    )
+    assert os.path.realpath(events[0]["text"]) == os.path.realpath(folder)
 
 
 def test_discovery_starts_no_inspection_after_its_deadline(tmp_path, monkeypatch):

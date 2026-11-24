@@ -145,10 +145,18 @@ class Monitors:
             if value["status"] in {"running", "starting"} and value.get("pid") == pid and gone:
                 if pid is None and value.get("stop_requested"):
                     # As begin() decides: a stop request comes first.
-                    _end(db, value, "stopped", STOPPED_BEFORE_START)
+                    _end(db, value, "stopped", STOPPED_BEFORE_START, before_start=True)
                 else:
                     _end(db, value, "interrupted", None, error=error)
         return value
+
+    def _launch_failed(self, monitor_id: str, error: Exception) -> None:
+        """Record that no worker started, unless a stop was recorded meanwhile."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            if (value := json.loads(row[0]))["status"] == "starting":
+                _end(db, value, "failed", None, error=str(error))
 
     def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
         """Admit the worker: record its process and return the record, whose
@@ -166,13 +174,22 @@ class Monitors:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
-            if value["status"] != "starting":
-                return None
             judged = "start_token" in lifetime or (
                 "start_token" not in value["owner"] and "process_created_at" in lifetime
             )
+            if value.get("before_start") and not value.get("pid") and judged:
+                # A reader recorded the stop before this worker came: it takes
+                # on the stop notice, which only a worker sends.
+                value.update(**lifetime, updated_at=time.time())
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
+                return value
+            if value["status"] != "starting":
+                return None
             if value.get("stop_requested"):
-                _end(db, value, "stopped", STOPPED_BEFORE_START, **(lifetime if judged else {}))
+                fields = {**(lifetime if judged else {}), "before_start": True}
+                _end(db, value, "stopped", STOPPED_BEFORE_START, **fields)
                 return value if judged else None
             if _start_overdue(value):
                 _end(db, value, "interrupted", None, error=DID_NOT_START)
@@ -301,7 +318,7 @@ class Monitors:
                 self.store.root / f"{identity}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
             )
         except OSError as error:
-            self.update(identity, status="failed", error=str(error))
+            self._launch_failed(identity, error)
             raise
         try:
             subprocess.Popen(
@@ -326,7 +343,7 @@ class Monitors:
                 start_new_session=True,
             )
         except Exception as error:  # no worker started
-            self.update(identity, status="failed", error=str(error))
+            self._launch_failed(identity, error)
             raise
         finally:
             with suppress(OSError):  # the worker has its own copy
