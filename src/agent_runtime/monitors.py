@@ -97,16 +97,21 @@ class Monitors:
         persistent: bool = False,
         cwd: Path | None = None,
         timeout_ms: int = 300_000,
-        owner_pid: int | None = None,
+        owner: tuple[int, str] | None = None,
     ) -> dict[str, Any]:
-        """Start a monitor for the current native session. owner_pid, when given,
-        is the native process that the caller verified; the monitor is created
-        only while the session's record still names it."""
+        """Start a monitor for the current native session.
+
+        For agy, owner is the agy process lifetime (PID, start token) that the
+        caller verified (agent_runtime.operations does); the monitor is created
+        only while the session's record names it, in the same transaction.
+        """
         provider, session_id = current_identity()
         if provider == "codex":
             raise ValueError("use the Codex monitor adapter for a Codex session")
+        if provider == "agy" and owner is None:
+            raise ValueError("start agy monitors through agent_runtime.operations")
         target = self.registry.get(provider, session_id)
-        if not process_alive(target):
+        if provider == "claude_code" and not process_alive(target):
             raise RuntimeError("current native process is not live")
         key = owner_key(provider, session_id)
         bridge = target.get("bridge")
@@ -129,6 +134,11 @@ class Monitors:
         if not directory.is_dir():
             raise ValueError("cwd must be a directory")
         identity = "m" + uuid.uuid4().hex
+        if owner is not None:
+            # An agy owner lives while its lifetime holds the conversation.
+            lifetime = {"pid": owner[0], "start_token": owner[1], "conversation": session_id}
+        else:
+            lifetime = {"pid": target["pid"], "process_created_at": target["process_created_at"]}
         value = {
             "monitor_id": identity,
             "session_id": key,
@@ -143,15 +153,16 @@ class Monitors:
             "permission_class": "prompting"
             if provider == "agy"
             else permission_class(target.get("permission_mode")),
-            "owner": {"pid": target["pid"], "process_created_at": target["process_created_at"]},
+            "owner": lifetime,
         }
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if owner_pid is not None:
+            if owner is not None:
                 row = db.execute(
                     "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, session_id)
                 ).fetchone()
-                if row is None or json.loads(row[0]).get("pid") != owner_pid:
+                current = json.loads(row[0]) if row else {}
+                if (current.get("pid"), current.get("native_start")) != owner:
                     raise RuntimeError("the session moved to another native process")
             db.execute("INSERT INTO monitors VALUES(?,?,?)", (identity, key, json.dumps(value)))
         # The monitored command is not the session: it gets neither its message
@@ -217,19 +228,21 @@ class Monitors:
             ]
 
     def claim(
-        self, session_id: str, *, owner: tuple[Provider, str, int] | None = None
+        self, session_id: str, *, owner: tuple[Provider, str, int, str] | None = None
     ) -> list[dict[str, Any]]:
         """Mark up to 32 pending events dispatching and return them. With owner
-        (provider, native session ID, PID), claim nothing unless the session's
-        record still names that process, in the same transaction."""
+        (provider, native session ID, PID, start token), claim nothing unless the
+        session's record still names that process lifetime, in the same
+        transaction."""
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if owner is not None:
-                provider, native_id, pid = owner
+                provider, native_id, pid, token = owner
                 row = db.execute(
                     "SELECT value FROM sessions WHERE provider=? AND id=?", (provider, native_id)
                 ).fetchone()
-                if row is None or json.loads(row[0]).get("pid") != pid:
+                current = json.loads(row[0]) if row else {}
+                if (current.get("pid"), current.get("native_start")) != (pid, token):
                     return []
             rows = db.execute(
                 "SELECT * FROM monitor_events WHERE session_id=? AND status='pending' "

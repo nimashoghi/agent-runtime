@@ -38,8 +38,8 @@ def identity() -> tuple[Provider, str]:
     return _identity()[:2]
 
 
-def _identity() -> tuple[Provider, str, int | None]:
-    """The current session, and for agy the agy process that its bridge serves."""
+def _identity() -> tuple[Provider, str, tuple[int, str] | None]:
+    """The current session, and for agy the agy process lifetime that its bridge serves."""
     provider, session_id = current_identity()
     if provider == "codex":
         value = codex_command("agents", "whoami")
@@ -49,7 +49,7 @@ def _identity() -> tuple[Provider, str, int | None]:
     if provider == "agy":
         # Only a command of the agy session holds its message credentials, so
         # every operation that it runs starts or confirms its delivery bridge.
-        return provider, session_id, agy.ensure_bridge(session_id)["pid"]
+        return provider, session_id, agy.ensure_bridge(session_id)
     return provider, session_id, None
 
 
@@ -61,7 +61,7 @@ def monitor_start(
     cwd: Path | None = None,
     timeout_ms: int = 300_000,
 ) -> dict[str, Any]:
-    provider, session_id, native_pid = _identity()
+    provider, session_id, owner = _identity()
     if provider != "codex":
         return Monitors().start(
             command,
@@ -69,7 +69,7 @@ def monitor_start(
             persistent=persistent,
             cwd=cwd,
             timeout_ms=timeout_ms,
-            owner_pid=native_pid,
+            owner=owner,
         )
     arguments = [
         "monitors",
@@ -133,11 +133,8 @@ def agents() -> list[dict[str, Any]]:
         # The first operation of a resumed agy session restarts its delivery.
         agy.ensure_bridge(session_id)
     registry = Registry()
-    values = [
-        {**value, "provider": provider}
-        for provider in ("claude_code", "agy")
-        for value in registry.live_sessions(provider)
-    ]
+    values = [{**value, "provider": "claude_code"} for value in registry.claude_sessions()]
+    values.extend({**value, "provider": "agy"} for value in agy.live_sessions(registry))
     with suppress(FileNotFoundError):
         values.extend({**value, "provider": "codex"} for value in codex_command("agents", "list"))
     return values

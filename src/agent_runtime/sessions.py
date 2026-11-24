@@ -74,17 +74,10 @@ class Registry:
             )
         return json.loads(row[0])
 
-    def live_sessions(self, provider: Literal["claude_code", "agy"]) -> list[dict[str, Any]]:
-        """The registered sessions of a provider whose native process is live.
-
-        Codex records have no process; ``codexr agents list`` lists Codex roots.
-        """
-        with self.store.connect() as db:
-            rows = db.execute("SELECT value FROM sessions WHERE provider=?", (provider,)).fetchall()
-        return [record for row in rows if process_alive(record := json.loads(row[0]))]
-
     def claude_sessions(self) -> list[dict[str, Any]]:
-        return self.live_sessions("claude_code")
+        with self.store.connect() as db:
+            rows = db.execute("SELECT value FROM sessions WHERE provider='claude_code'").fetchall()
+        return [record for row in rows if process_alive(record := json.loads(row[0]))]
 
 
 class IdentityUnavailable(RuntimeError):

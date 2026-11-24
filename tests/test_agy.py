@@ -41,7 +41,9 @@ with open(RECORD, "a") as record:
     record.write(json.dumps({
         "argv": sys.argv[1:],
         "address": os.environ.get("ANTIGRAVITY_LS_ADDRESS") == "127.0.0.1:1",
-        "token": os.environ.get("ANTIGRAVITY_CSRF_TOKEN") == "fixture-token",
+        "token": {"fixture-token": "first", "fixture-token-2": "second"}.get(
+            os.environ.get("ANTIGRAVITY_CSRF_TOKEN"), "other"
+        ),
     }) + "\\n")
 if pathlib.Path(RECORD + ".fail").exists():
     print(json.dumps({"error": "rejected fixture-token at 127.0.0.1:1"}))
@@ -127,7 +129,7 @@ class Agy:
         self.results = itertools.count()
         self.state = tmp_path / "state"
 
-    def run(self, op, *, hook=True):
+    def run(self, op, *, hook=True, token="fixture-token"):
         """Start an agy process that runs a hook and then one command; return the
         process and the command's result."""
         result = self.tmp / f"result-{next(self.results)}.json"
@@ -141,9 +143,14 @@ class Agy:
         steps = [{"argv": [sys.executable, "-c", HOOK, json.dumps(payload)], "env": self.hook_env}]
         steps = steps if hook else []
         command = [sys.executable, "-c", AGENT, str(result), json.dumps(op)]
-        steps.append({"argv": command, "env": self.command_env})
+        steps.append(
+            {"argv": command, "env": {**self.command_env, "ANTIGRAVITY_CSRF_TOKEN": token}}
+        )
         process = subprocess.Popen(
-            [sys.executable, "-c", FAKE_AGY, str(self.lock)], stdin=subprocess.PIPE, text=True
+            [sys.executable, "-c", FAKE_AGY, str(self.lock)],
+            stdin=subprocess.PIPE,
+            text=True,
+            env={"PATH": os.environ["PATH"]},
         )
         process.stdin.write(json.dumps(steps))
         process.stdin.close()
@@ -189,7 +196,7 @@ def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
     texts = [event["text"] for event in events[:4]]
     assert texts == ["first", "no-token", "no-address", "no-conversation"]
     sent = agy.calls()
-    assert sent and all(call["address"] and call["token"] for call in sent)
+    assert sent and all(call["address"] and call["token"] == "first" for call in sent)
     assert all(call["argv"][:3] == ["agentapi", "send-message", agy.session_id] for call in sent)
     # The notice names the events; the output itself stays out of agy's system role.
     assert "monitor_events(after=" in sent[0]["argv"][3]
@@ -215,10 +222,12 @@ def test_a_resumed_session_gets_the_output_of_a_persistent_monitor(conversation)
         lambda: any(e["text"] == "after-resume" and e["status"] == "pending" for e in agy.events())
     )
     assert not agy.calls()
-    # A new agy process of the same conversation runs any operation.
-    second, listed = agy.run({"name": "list"})
+    # A new agy process of the same conversation, with its own credentials,
+    # runs any operation; its bridge delivers with them.
+    second, listed = agy.run({"name": "list"}, token="fixture-token-2")
     assert [value["monitor_id"] for value in listed] == [monitor["monitor_id"]]
     wait_for(lambda: all(event["status"] == "transport-written" for event in agy.events()))
+    assert [call["token"] for call in agy.calls()] == ["second"]
     assert Registry(agy.state).get("agy", agy.session_id)["bridge"]["native_pid"] == second.pid
 
 
@@ -267,6 +276,20 @@ def test_an_agy_session_does_not_see_a_claude_monitor_of_the_same_id(conversatio
     with monitors.store.connect() as db:
         row = db.execute("SELECT value FROM monitors WHERE id='mclaude'").fetchone()
     assert json.loads(row[0])["status"] == "running"
+
+
+def test_an_agy_monitor_starts_only_for_a_verified_agy_process(tmp_path, monkeypatch):
+    for name in (
+        "AGENT_SESSION_PROVIDER",
+        "AGENT_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", str(uuid.uuid4()))
+
+    with pytest.raises(ValueError, match=r"through agent_runtime\.operations"):
+        Monitors(tmp_path / "state").start("echo one", description="direct")
 
 
 def test_a_hook_outside_its_agy_process_does_not_register(tmp_path, monkeypatch):

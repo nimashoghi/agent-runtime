@@ -66,6 +66,8 @@ def inbox(tmp_path, monkeypatch):
         }.items():
             monkeypatch.setenv(name, value)
         monkeypatch.delenv("AGENT_SESSION_PROVIDER", raising=False)
+        # A suite run from an agy session must not see its conversation.
+        monkeypatch.delenv("ANTIGRAVITY_CONVERSATION_ID", raising=False)
         registry = Registry(tmp_path)
         own_claude_registration(sid, str(tmp_path), "bypassPermissions", registry=registry)
         bridge = subprocess.Popen(
