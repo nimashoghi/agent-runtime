@@ -107,10 +107,8 @@ with open(sys.argv[1] + ".partial", "w") as output:
 os.replace(sys.argv[1] + ".partial", sys.argv[1])
 """
 
-PROBE = (
-    'printf "first\\n"; printf "%s\\n" "${ANTIGRAVITY_CSRF_TOKEN:-no-token}" '
-    '"${ANTIGRAVITY_LS_ADDRESS:-no-address}" "${ANTIGRAVITY_CONVERSATION_ID:-no-conversation}"'
-)
+# The names of the agy variables that the monitored command received, never values.
+PROBE = 'printf "first\\n"; env | sed -n "s/^\\(ANTIGRAVITY_[A-Z_]*\\)=.*/\\1/p"; printf "end\\n"'
 
 
 def wait_for(predicate, timeout=15):
@@ -159,6 +157,7 @@ class Agy:
         self.command_env = {
             **self.hook_env,
             "ANTIGRAVITY_AGENT": "1",
+            "ANTIGRAVITY_TRAJECTORY_ID": "trajectory-1",
             "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
             "ANTIGRAVITY_CSRF_TOKEN": "fixture-token",
             "ANTIGRAVITY_AGENTAPI_EXE": str(agentapi),
@@ -235,14 +234,15 @@ def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
     # The output lines and the completion notice, each delivered.
     events = wait_for(
         lambda: (
-            len(found := agy.events()) == 5
+            len(found := agy.events()) == 3
             and all(event["status"] == "transport-written" for event in found)
             and found
         )
     )
-    # The monitored command has neither the credentials nor the conversation.
-    texts = [event["text"] for event in events[:4]]
-    assert texts == ["first", "no-token", "no-address", "no-conversation"]
+    # The monitored command received no agy variable: between its two lines,
+    # it printed the name of each one that it had.
+    texts = [event["text"] for event in events[:2]]
+    assert texts == ["first", "end"]
     sent = agy.calls()
     assert sent and all(call["address"] and call["token"] == "first" for call in sent)
     assert all(call["argv"][:3] == ["agentapi", "send-message", agy.session_id] for call in sent)
@@ -521,6 +521,47 @@ def test_an_old_process_does_not_hold_a_replaced_presence_lock(tmp_path, monkeyp
                 holds(os.getpid(), lock)
 
 
+def test_a_lock_renamed_over_during_the_scan_is_unknown(tmp_path, monkeypatch):
+    # agy opens a new lock, renames it over the name and closes the old one,
+    # while the descriptors are read: no descriptor matches, and yet it holds.
+    lock = tmp_path / "conversation.lock"
+    lock.touch()
+    old = lock.open()
+    new_name = tmp_path / "new.lock"
+    new_name.touch()
+    new = new_name.open()
+    listing = processes._descriptors
+
+    def renaming(pid):
+        found = listing(pid)
+        os.replace(new_name, lock)
+        old.close()
+        return found
+
+    monkeypatch.setattr(processes, "_descriptors", renaming)
+    try:
+        with pytest.raises(OSError, match="changed during the scan"):
+            holds(os.getpid(), lock)
+    finally:
+        old.close()
+        new.close()
+
+
+def test_a_zombie_is_gone_without_a_boot_id(monkeypatch):
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        process = psutil.Process(child.pid)
+        wait_for(lambda: process.status() == psutil.STATUS_ZOMBIE)
+
+        def unreadable():
+            raise OSError(errno.EPERM, "operation not permitted")
+
+        monkeypatch.setattr(processes, "boot_id", unreadable)
+        assert processes.lifetime_alive(child.pid, "any token") is False
+    finally:
+        child.wait()
+
+
 def test_an_unreadable_presence_lock_leaves_the_owner_unknown(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     lock = processes.presence_lock("c1")
@@ -621,11 +662,73 @@ def test_a_monitor_stopped_before_its_worker_started_never_runs(tmp_path):
     with monitors.store.connect() as db:
         db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mstop", "agy:c1", json.dumps(record)))
 
-    assert monitors.begin("mstop", pid=os.getpid(), process_created_at=1.0, start_token="w") is None
+    begun = monitors.begin("mstop", pid=os.getpid(), process_created_at=1.0, start_token="w")
 
+    # The worker gets the record, to deliver the stop notice, and runs no command.
+    assert begun is not None and begun["status"] == "stopped"
     assert monitors.get("mstop")["status"] == "stopped"
     (event,) = monitors.events("agy:c1")
     assert event["text"] == "Monitor mstop stopped before its command started."
+
+
+@pytest.mark.parametrize("reader_first", [True, False])
+def test_a_stop_before_an_expired_start_ends_the_same_either_way(tmp_path, reader_first):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mlate",
+        "session_id": "agy:c1",
+        "status": "starting",
+        "stop_requested": True,
+        "created_at": time.time() - 61,
+        "started": {"boot": None, "monotonic": time.monotonic() - 61},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mlate", "agy:c1", json.dumps(record)))
+    lifetime = {"pid": os.getpid(), "process_created_at": 1.0, "start_token": "w"}
+    if reader_first:
+        monitors.get("mlate")
+        monitors.begin("mlate", **lifetime)
+    else:
+        monitors.begin("mlate", **lifetime)
+        monitors.get("mlate")
+    assert monitors.get("mlate")["status"] == "stopped"
+    assert [event["text"] for event in monitors.events("agy:c1")] == [
+        "Monitor mlate stopped before its command started."
+    ]
+
+
+def test_a_worker_stopped_before_its_start_only_delivers_the_notice(tmp_path, monkeypatch):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "mquiet",
+        "session_id": "agy:c1",
+        "command": "touch should-not-exist",
+        "cwd": str(tmp_path),
+        "persistent": False,
+        "timeout_ms": 60_000,
+        "status": "starting",
+        "stop_requested": True,
+        "created_at": time.time(),
+        "started": {"boot": None, "monotonic": time.monotonic()},
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("mquiet", "agy:c1", json.dumps(record)))
+    delivered = []
+
+    async def deliver(_monitors, identity, _owner, finish):
+        delivered.append((identity, finish.final))
+
+    monkeypatch.setattr(monitor_worker, "_deliver", deliver)
+    disposition = signal.getsignal(signal.SIGCHLD)
+    try:
+        asyncio.run(monitor_worker.run(tmp_path, "mquiet"))
+    finally:
+        signal.signal(signal.SIGCHLD, disposition)
+    assert delivered == [("mquiet", True)]
+    assert not (tmp_path / "should-not-exist").exists()
+    assert monitors.get("mquiet")["status"] == "stopped"
 
 
 def test_a_reader_without_the_boot_id_keeps_the_monotonic_grace(tmp_path, monkeypatch):
@@ -671,6 +774,38 @@ def test_discovery_inspects_every_session_within_its_budget(tmp_path, monkeypatc
     monkeypatch.setattr(agy_module, "agy_alive", slow)
     found = agy_module.live_sessions(registry)
     assert sorted(record["session_id"] for record in found) == sorted(f"c{i}" for i in range(40))
+
+
+def test_discovery_starts_no_inspection_after_its_deadline(tmp_path, monkeypatch):
+    registry = Registry(tmp_path)
+    _agy_records(registry, 5)
+    calls = []
+
+    def counted(_pid, _token, session_id):
+        calls.append(session_id)
+        return True
+
+    monkeypatch.setattr(agy_module, "agy_alive", counted)
+    assert agy_module.live_sessions(registry, timeout=0) == []
+    assert calls == []
+
+
+def test_an_owner_lookup_that_does_not_end_fails_monitor_start(monkeypatch):
+    for name, value in {
+        "ANTIGRAVITY_CONVERSATION_ID": "c1",
+        "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+        "ANTIGRAVITY_CSRF_TOKEN": "fixture-token",
+        "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
+    }.items():
+        monkeypatch.setenv(name, value)
+    release = threading.Event()
+    monkeypatch.setattr(agy_module, "native_process", lambda _session_id: release.wait(5))
+    monkeypatch.setattr(agy_module, "OWNER_TIMEOUT", 0.1)
+    try:
+        with pytest.raises(RuntimeError, match=r"was not found in 0\.1 s"):
+            agy_module.command_owner("c1")
+    finally:
+        release.set()
 
 
 def test_a_thread_that_cannot_start_leaves_discovery_working(tmp_path, monkeypatch):

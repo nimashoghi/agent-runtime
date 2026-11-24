@@ -52,6 +52,9 @@ def lifetime_alive(pid: int, token: str) -> bool | None:
     """Whether the process of this lifetime runs; None when it cannot be inspected."""
     try:
         process = psutil.Process(pid)
+        # A zombie has exited, whoever's it is; this needs no boot ID.
+        if process.status() == psutil.STATUS_ZOMBIE:
+            return False
         return start_token(process) == token and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
@@ -220,6 +223,11 @@ def _named_file(path: Path) -> tuple[int, int] | None:
     return device, status.st_ino
 
 
+class _LockChanged(OSError):
+    def __init__(self) -> None:
+        super().__init__(errno.EAGAIN, "the presence lock changed during the scan")
+
+
 def holds(pid: int, lock: Path) -> bool:
     """Whether the process has the file that the lock's name identifies open.
 
@@ -227,9 +235,10 @@ def holds(pid: int, lock: Path) -> bool:
     agy replaced does not count for an old process that still has the old file
     open. A descriptor that matches is checked again, with the name, right
     before the answer, so a lock that agy released or replaced meanwhile does
-    not count. A descriptor that cannot be inspected is passed over; when no
-    other one matches, the answer is unknown. Raises OSError for unknown. Every
-    call releases the GIL.
+    not count; and it answers that the process does not hold the lock only if
+    the name kept its file through the scan. A descriptor that cannot be
+    inspected is passed over; when no other one matches, the answer is
+    unknown. Raises OSError for unknown. Every call releases the GIL.
     """
     if (named := _named_file(lock)) is None:
         return False
@@ -239,13 +248,16 @@ def holds(pid: int, lock: Path) -> bool:
             if _descriptor_file(pid, fd) != named:
                 continue
             if _named_file(lock) != named:
-                raise OSError(errno.EAGAIN, "the presence lock changed during the scan")
+                raise _LockChanged
             if _descriptor_file(pid, fd) == named:
                 return True
-        except OSError as error:
-            if error.errno == errno.EAGAIN:
-                raise
+        except _LockChanged:
+            raise
+        except OSError as error:  # this descriptor only: look at the others
             unknown = error
+    # No: but only if the name kept its file, which agy may have replaced meanwhile.
+    if _named_file(lock) != named:
+        raise _LockChanged
     if unknown is not None:
         raise unknown
     return False

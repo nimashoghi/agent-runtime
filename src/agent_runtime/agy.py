@@ -86,6 +86,9 @@ def native_process(session_id: str) -> Owner:
     )
 
 
+OWNER_TIMEOUT = 10
+
+
 def command_owner(session_id: str) -> Owner:
     """The agy process lifetime whose credentials this command holds."""
     if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != agy_conversation(session_id):
@@ -95,7 +98,27 @@ def command_owner(session_id: str) -> Owner:
             f"agy message credentials are unavailable ({', '.join(missing)}); "
             "start agy monitors from a command of the agy session"
         )
-    return native_process(session_id)
+    # A stalled file system can hold up the scan of the ancestors' descriptors.
+    found: list[Owner] = []
+    failed: list[BaseException] = []
+
+    def find() -> None:
+        try:
+            found.append(native_process(session_id))
+        except BaseException as error:  # handed to the caller
+            failed.append(error)
+
+    thread = threading.Thread(target=find, daemon=True)
+    thread.start()
+    thread.join(OWNER_TIMEOUT)
+    if failed:
+        raise failed[0]
+    if not found:
+        raise RuntimeError(
+            f"the agy process of this command was not found in {OWNER_TIMEOUT} s; "
+            "a file system may not be answering"
+        )
+    return found[0]
 
 
 def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> None:
@@ -195,7 +218,8 @@ def live_sessions(
     inspections: list[_Inspection | None] = []
     for record in records:
         key = (record.get("pid", 0), record.get("native_start", ""), record["session_id"])
-        while (inspection := _inspection(key)) is None and time.monotonic() < deadline:
+        inspection = None
+        while time.monotonic() < deadline and (inspection := _inspection(key)) is None:
             time.sleep(0.01)
         inspections.append(inspection)
     live = []

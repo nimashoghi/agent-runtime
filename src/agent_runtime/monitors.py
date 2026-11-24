@@ -30,6 +30,25 @@ def owner_key(provider: Provider, session_id: str) -> str:
 
 
 DID_NOT_START = "monitor worker did not start"
+STOPPED_BEFORE_START = "stopped before its command started."
+
+
+def _end(db: Any, value: dict[str, Any], status: str, text: str | None, **fields: Any) -> None:
+    """Record a monitor's outcome, and its event "Monitor <id> <text>" when
+    there is text, in the caller's transaction; value is updated in place."""
+    value.update(status=status, **fields, updated_at=time.time())
+    db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), value["monitor_id"]))
+    if text is not None:
+        db.execute(
+            "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+            "VALUES(?,?,?,'pending',?)",
+            (
+                value["monitor_id"],
+                value["session_id"],
+                f"Monitor {value['monitor_id']} {text}",
+                time.time(),
+            ),
+        )
 
 
 def _start_mark() -> dict[str, Any]:
@@ -124,19 +143,24 @@ class Monitors:
             # Without a PID, the worker never recorded itself and its time is up.
             gone = _start_overdue(value) if pid is None else not _worker_alive(value)
             if value["status"] in {"running", "starting"} and value.get("pid") == pid and gone:
-                value.update(status="interrupted", error=error, updated_at=time.time())
-                db.execute(
-                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
-                )
+                if pid is None and value.get("stop_requested"):
+                    # As begin() decides: a stop request comes first.
+                    _end(db, value, "stopped", STOPPED_BEFORE_START)
+                else:
+                    _end(db, value, "interrupted", None, error=error)
         return value
 
     def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
-        """Record the worker's own process as running the monitor, or return None
-        when the monitor no longer waits for a worker (given up or failed).
+        """Admit the worker: record its process and return the record, whose
+        status is "running", or "stopped" when a stop came before the start (the
+        worker then runs no command and delivers the stop notice). Return None
+        when the worker must exit at once.
 
-        Readers judge a worker by its start token, or a Claude monitor's worker
-        without one by its creation time; a worker without what they need
-        fails here, with its event, in the same transaction.
+        One transaction decides, in this order of precedence, which a reader's
+        get() keeps too: a stop request, an expired startup grace ("did not
+        start"), and a worker that readers could not judge (by its start token,
+        or for a Claude monitor's worker without one, by its creation time),
+        which fails with its event.
         """
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -144,49 +168,18 @@ class Monitors:
             value = json.loads(row[0])
             if value["status"] != "starting":
                 return None
-            if value.get("stop_requested"):
-                # Stopped before it started: the command never runs.
-                value.update(status="stopped", updated_at=time.time())
-                db.execute(
-                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
-                )
-                db.execute(
-                    "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
-                    "VALUES(?,?,?,'pending',?)",
-                    (
-                        monitor_id,
-                        value["session_id"],
-                        f"Monitor {monitor_id} stopped before its command started.",
-                        time.time(),
-                    ),
-                )
-                return None
-            if _start_overdue(value):
-                # Readers may already have reported this; a late worker never runs.
-                value.update(status="interrupted", error=DID_NOT_START, updated_at=time.time())
-                db.execute(
-                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
-                )
-                return None
             judged = "start_token" in lifetime or (
                 "start_token" not in value["owner"] and "process_created_at" in lifetime
             )
+            if value.get("stop_requested"):
+                _end(db, value, "stopped", STOPPED_BEFORE_START, **(lifetime if judged else {}))
+                return value if judged else None
+            if _start_overdue(value):
+                _end(db, value, "interrupted", None, error=DID_NOT_START)
+                return None
             if not judged:
                 error = "the monitor worker cannot read its own process identity"
-                value.update(status="failed", error=error, updated_at=time.time())
-                db.execute(
-                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
-                )
-                db.execute(
-                    "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
-                    "VALUES(?,?,?,'pending',?)",
-                    (
-                        monitor_id,
-                        value["session_id"],
-                        f"Monitor {monitor_id} failed: {error}",
-                        time.time(),
-                    ),
-                )
+                _end(db, value, "failed", f"failed: {error}", error=error)
                 return None
             value.update(status="running", **lifetime, updated_at=time.time())
             db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))

@@ -141,8 +141,9 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             assert bridge["native_pid"] == owner.pid
             assert process_alive(bridge)
             # The bridge holds Claude's inbox token and none of agy's authority.
-            environment = psutil.Process(bridge["pid"]).environ()
-            assert not set(environment) & {*AGY_IDENTITY, *AGY_CREDENTIALS}
+            # Names only, so that a failure prints no value.
+            names = set(psutil.Process(bridge["pid"]).environ())
+            assert not names & {*AGY_IDENTITY, *AGY_CREDENTIALS}
 
             prompt = {
                 **payload,

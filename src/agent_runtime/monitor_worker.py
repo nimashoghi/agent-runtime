@@ -53,6 +53,14 @@ async def run(directory: Path, identity: str) -> None:
     if (value := monitors.begin(identity, **lifetime)) is None:
         return  # given up, or failed before this worker started
     assert process is not None  # begin() accepted an identity read from it
+    if value["status"] == "stopped":
+        # Stopped before the command started: only the stop notice is left.
+        if "start_token" in value["owner"]:
+            finish = _Finish(deadline=time.monotonic() + FINAL_DELIVERY, final=True)
+            bound = FINAL_DELIVERY + agy.AGENTAPI_TIMEOUT + 5
+            with suppress(Exception):
+                await asyncio.wait_for(_deliver(monitors, identity, value["owner"], finish), bound)
+        return
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
