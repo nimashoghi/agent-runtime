@@ -107,8 +107,9 @@ class Monitors:
         """Record the worker's own process as running the monitor, or return None
         when the monitor no longer waits for a worker (given up or failed).
 
-        Readers judge an agy worker by its start token, so an agy worker without
-        one fails here, with its event, in the same transaction.
+        Readers judge a worker by its start token, or a Claude monitor's worker
+        without one by its creation time; a worker without what they need
+        fails here, with its event, in the same transaction.
         """
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -116,8 +117,11 @@ class Monitors:
             value = json.loads(row[0])
             if value["status"] != "starting":
                 return None
-            if "start_token" in value["owner"] and "start_token" not in lifetime:
-                error = "the monitor worker cannot read its start token"
+            judged = "start_token" in lifetime or (
+                "start_token" not in value["owner"] and "process_created_at" in lifetime
+            )
+            if not judged:
+                error = "the monitor worker cannot read its own process identity"
                 value.update(status="failed", error=error, updated_at=time.time())
                 db.execute(
                     "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)

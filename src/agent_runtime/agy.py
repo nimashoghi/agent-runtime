@@ -12,9 +12,11 @@ data with ``monitor_events``. No other process can message an agy session.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -125,16 +127,36 @@ def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> 
             return
 
 
-def live_sessions(registry: Registry | None = None) -> list[dict[str, Any]]:
-    """The registered agy sessions whose agy process still holds the conversation."""
+def live_sessions(
+    registry: Registry | None = None, *, timeout: float = 2.0
+) -> list[dict[str, Any]]:
+    """The registered agy sessions whose agy process still holds the conversation.
+
+    Each process is inspected in a daemon thread, and an inspection that has
+    not ended after the timeout (a stalled file system) counts as unknown and
+    leaves its session out, so that it cannot hold up discovery of the others.
+    """
     with (registry or Registry()).store.connect() as db:
         rows = db.execute("SELECT value FROM sessions WHERE provider='agy'").fetchall()
     records = [json.loads(row[0]) for row in rows]
-    return [
-        record
-        for record in records
-        if agy_alive(record.get("pid", 0), record.get("native_start", ""), record["session_id"])
+    alive: dict[int, bool | None] = {}
+
+    def inspect(index: int, record: dict[str, Any]) -> None:
+        with contextlib.suppress(Exception):
+            alive[index] = agy_alive(
+                record.get("pid", 0), record.get("native_start", ""), record["session_id"]
+            )
+
+    threads = [
+        threading.Thread(target=inspect, args=(index, record), daemon=True)
+        for index, record in enumerate(records)
     ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return [record for index, record in enumerate(records) if alive.get(index) is True]
 
 
 def notice(session_id: str, events: list[dict[str, Any]]) -> str:
@@ -174,7 +196,9 @@ def send_notice(session_id: str, text: str, confirm: Callable[[], bool]) -> tupl
         status = child.wait(timeout=AGENTAPI_TIMEOUT)
     except subprocess.TimeoutExpired:
         child.kill()
-        child.wait()
+        # A child stuck in the kernel is left for the system to reap.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=5)
         return "uncertain", f"agentapi did not finish in {AGENTAPI_TIMEOUT} s"
     # A zero exit means that agy's local server took the notice, not that the
     # model read it.

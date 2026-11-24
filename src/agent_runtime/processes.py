@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import re
 import sys
@@ -56,39 +58,115 @@ def agy_conversation(session_id: str) -> str:
 
 
 def presence_lock(session_id: str) -> Path:
-    """The file that the live agy process of a conversation keeps open."""
+    """The name of the file that the live agy process of a conversation keeps
+    open. It is not resolved: holds() follows it when it looks."""
     folder = Path.home() / ".gemini" / "antigravity-cli" / "presence"
-    return (folder / f"{agy_conversation(session_id)}.lock").resolve()
+    return folder / f"{agy_conversation(session_id)}.lock"
+
+
+if sys.platform == "darwin":
+    # sys/proc_info.h: proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO) gives the device
+    # and inode of another process's open file, which psutil does not.
+    class _VinfoStat(ctypes.Structure):
+        _fields_ = [
+            ("vst_dev", ctypes.c_uint32),
+            ("vst_mode", ctypes.c_uint16),
+            ("vst_nlink", ctypes.c_uint16),
+            ("vst_ino", ctypes.c_uint64),
+            ("vst_uid", ctypes.c_uint32),
+            ("vst_gid", ctypes.c_uint32),
+            ("vst_times", ctypes.c_int64 * 8),
+            ("vst_size", ctypes.c_int64),
+            ("vst_blocks", ctypes.c_int64),
+            ("vst_blksize", ctypes.c_int32),
+            ("vst_flags", ctypes.c_uint32),
+            ("vst_gen", ctypes.c_uint32),
+            ("vst_rdev", ctypes.c_uint32),
+            ("vst_qspare", ctypes.c_int64 * 2),
+        ]
+
+    class _VnodeInfoPath(ctypes.Structure):
+        _fields_ = [
+            ("vi_stat", _VinfoStat),
+            ("vi_type", ctypes.c_int),
+            ("vi_pad", ctypes.c_int),
+            ("vi_fsid", ctypes.c_int32 * 2),
+            ("vip_path", ctypes.c_char * 1024),
+        ]
+
+    class _VnodeFdInfoWithPath(ctypes.Structure):
+        _fields_ = [
+            ("fi_openflags", ctypes.c_uint32),
+            ("fi_status", ctypes.c_uint32),
+            ("fi_offset", ctypes.c_int64),
+            ("fi_type", ctypes.c_int32),
+            ("fi_guardflags", ctypes.c_uint32),
+            ("pvip", _VnodeInfoPath),
+        ]
+
+    _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    _LIBPROC.proc_pidfdinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    _LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
+    _PROC_PIDFDVNODEPATHINFO = 2
+
+
+def _descriptor_file(pid: int, fd: int) -> tuple[int, int] | None:
+    """The device and inode of a process's open file, or None when the
+    descriptor is closed."""
+    if sys.platform.startswith("linux"):
+        try:
+            status = os.stat(f"/proc/{pid}/fd/{fd}")
+        except FileNotFoundError:
+            return None
+        return status.st_dev, status.st_ino
+    if sys.platform == "darwin":
+        info = _VnodeFdInfoWithPath()
+        size = ctypes.sizeof(info)
+        if (
+            _LIBPROC.proc_pidfdinfo(pid, fd, _PROC_PIDFDVNODEPATHINFO, ctypes.byref(info), size)
+            != size
+        ):
+            if (error := ctypes.get_errno()) == errno.EBADF:
+                return None
+            raise OSError(error, os.strerror(error))
+        return info.pvip.vi_stat.vst_dev, info.pvip.vi_stat.vst_ino
+    raise NotImplementedError(f"agy sessions need Linux or macOS, not {sys.platform}")
+
+
+def _named_file(path: Path) -> tuple[int, int] | None:
+    """The device and inode of the file that a name identifies now, in the
+    form of _descriptor_file, or None when there is none."""
+    try:
+        status = os.stat(path)
+    except FileNotFoundError:
+        return None
+    # macOS reports the device of an open file as unsigned.
+    device = status.st_dev & 0xFFFFFFFF if sys.platform == "darwin" else status.st_dev
+    return device, status.st_ino
 
 
 def holds(process: psutil.Process, lock: Path) -> bool:
-    """Whether the process has the conversation's current lock file open.
+    """Whether the process has the file that the lock's name identifies open.
 
-    On Linux the open file must also be the lock's current inode, read after
-    the scan: psutil names a lock that was replaced, and that an old process
-    still holds open, by its old path, also when the replacement happens while
-    the open files are read.
+    psutil names an open file that was replaced at its path, and that a process
+    still holds open, by that path, so the open file must also be the same file
+    (device and inode) as the one that the name identifies after the scan: a
+    replacement before or during the scan does not count.
     """
-    linux = sys.platform.startswith("linux")
-    opened: list[tuple[int, int] | None] = []
+    target = lock.resolve()
+    opened = set()
     for file in process.open_files():
-        if Path(file.path).resolve() != lock:
-            continue
-        if not linux:
-            opened.append(None)
-            continue
-        try:
-            status = os.stat(f"/proc/{process.pid}/fd/{file.fd}")
-        except FileNotFoundError:  # closed meanwhile
-            continue
-        opened.append((status.st_dev, status.st_ino))
-    if not opened:
-        return False
-    try:
-        current = lock.stat()
-    except FileNotFoundError:
-        return False
-    return not linux or (current.st_dev, current.st_ino) in opened
+        if Path(file.path).resolve() == target and (
+            identity := _descriptor_file(process.pid, file.fd)
+        ):
+            opened.add(identity)
+    return bool(opened) and _named_file(lock) in opened
 
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:

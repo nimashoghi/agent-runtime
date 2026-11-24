@@ -41,11 +41,14 @@ async def run(directory: Path, identity: str) -> None:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     monitors = Monitors(directory)
     process = psutil.Process()
-    lifetime = {"pid": process.pid, "process_created_at": process.create_time()}
-    with suppress(OSError):  # without it, readers judge the worker by creation time
+    # What readers judge the worker by; begin() fails a worker that they cannot judge.
+    lifetime: dict[str, object] = {"pid": process.pid}
+    with suppress(psutil.Error, OSError):
+        lifetime["process_created_at"] = process.create_time()
+    with suppress(psutil.Error, OSError):
         lifetime["start_token"] = start_token(process)
     if (value := monitors.begin(identity, **lifetime)) is None:
-        return  # given up or failed before this worker started
+        return  # given up, or failed before this worker started
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
@@ -275,12 +278,13 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
         return finish.deadline is not None and time.monotonic() > finish.deadline
 
     def sendable() -> bool:
-        # The clock is read after the inspection, which can be slow.
-        return owner_state() is True and not late()
+        # The clock is read before the inspection, which can be slow, and after it.
+        return not late() and owner_state() is True and not late()
 
     def drain() -> str:
-        """Send the pending batches: "idle" when none is left, "closed" when the
-        owner is gone or the deadline passed, "retry" to try again later."""
+        """Send the pending batches: "idle" when none is left, "gone" when the
+        owner no longer holds the conversation, "closed" when the deadline
+        passed, "retry" to try again later."""
         while unsettled:
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
@@ -288,7 +292,9 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             if late():  # before an inspection, which can be slow
                 return "closed"
             state = owner_state()
-            if state is False or late():
+            if state is False:
+                return "gone"
+            if late():
                 return "closed"
             if state is None:
                 return "retry"
@@ -312,7 +318,9 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
         except Exception as error:  # a store error: report it and try again
             print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
             result = "retry"
-        if final and (result != "retry" or late()):
+        if result == "gone" or (final and (result != "retry" or late())):
+            # Nothing can wake a conversation that its process left; the
+            # events wait for monitor_events.
             return
         await asyncio.sleep(0.2 if result == "idle" else 1)
 

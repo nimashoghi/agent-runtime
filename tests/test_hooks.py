@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+import psutil
 import pytest
 
 from agent_runtime.claude import process_alive
@@ -125,6 +126,10 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
                 "CLAUDE_PID": str(owner.pid),
                 "CLAUDE_CODE_MESSAGING_SOCKET": str(Path(temporary) / "inbox.sock"),
                 "CLAUDE_CODE_MESSAGING_TOKEN": "fixture-token",
+                # A Claude session started from an agy command inherits these.
+                "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+                "ANTIGRAVITY_CSRF_TOKEN": "agy-token",
+                "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
             }.items():
                 monkeypatch.setenv(name, value)
 
@@ -134,6 +139,9 @@ def test_claude_session_start_starts_one_delivery_bridge(tmp_path, monkeypatch):
             bridge = registry.get("claude_code", session_id)["bridge"]
             assert bridge["native_pid"] == owner.pid
             assert process_alive(bridge)
+            # The bridge holds Claude's inbox token and none of agy's authority.
+            environment = psutil.Process(bridge["pid"]).environ()
+            assert not [name for name in environment if name.startswith("ANTIGRAVITY_")]
 
             prompt = {
                 **payload,
