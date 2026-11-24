@@ -100,7 +100,7 @@ def current_identity() -> tuple[Provider, str]:
                 "ambiguous native identity: an agy conversation and another session; "
                 "start the session without the other's environment"
             )
-        return "agy", agy_id
+        return "agy", agy_conversation(agy_id)
     provider = os.environ.get("AGENT_SESSION_PROVIDER")
     if provider == "claude_code" and (identity := os.environ.get("AGENT_SESSION_ID")):
         return "claude_code", identity

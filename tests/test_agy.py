@@ -3,11 +3,11 @@
 import itertools
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import suppress
 
 import psutil
 import pytest
@@ -15,6 +15,7 @@ import pytest
 from agent_runtime import operations
 from agent_runtime.hooks import app
 from agent_runtime.monitors import Monitors
+from agent_runtime.processes import lifetime_alive, start_token
 from agent_runtime.sessions import (
     AmbiguousIdentity,
     IdentityUnavailable,
@@ -39,8 +40,11 @@ AGENTAPI = """\
 import json, os, pathlib, sys, time
 
 if pathlib.Path(RECORD + ".block").exists():
+    # A send that runs until the test releases it.
     pathlib.Path(RECORD + ".started").touch()
-    time.sleep(5)  # a send that is still running
+    deadline = time.monotonic() + 60
+    while not pathlib.Path(RECORD + ".release").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 with open(RECORD, "a") as record:
     record.write(json.dumps({
@@ -274,30 +278,49 @@ def test_a_worker_that_dies_while_sending_leaves_its_batch_uncertain(conversatio
     agy = conversation
     (agy.tmp / "agentapi.jsonl.block").touch()
     _process, monitor = agy.run(
-        {"name": "start", "command": "echo one; sleep 3", "persistent": True}
+        {"name": "start", "command": "echo one; sleep 60", "persistent": True}
     )
     monitors = Monitors(agy.state)
-    # Kill the worker while agentapi runs.
     wait_for((agy.tmp / "agentapi.jsonl.started").exists)
-    os.kill(monitors.get(monitor["monitor_id"])["pid"], signal.SIGKILL)
-    wait_for(lambda: monitors.get(monitor["monitor_id"])["status"] == "interrupted")
-    (event,) = agy.events()
-    assert (event["text"], event["status"]) == ("one", "uncertain")
-    assert event["error"] == "delivery exited during a delivery attempt"
+    # The command and agentapi still run; kill the recorded worker lifetime.
+    record = monitors.get(monitor["monitor_id"])
+    worker = psutil.Process(record["pid"])
+    assert start_token(worker) == record["start_token"]
+    stragglers = worker.children(recursive=True)
+    try:
+        worker.kill()
+        wait_for(lambda: monitors.get(monitor["monitor_id"])["status"] == "interrupted")
+        (event,) = agy.events()
+        assert (event["text"], event["status"]) == ("one", "uncertain")
+        assert event["error"] == "delivery exited during a delivery attempt"
+    finally:
+        (agy.tmp / "agentapi.jsonl.release").touch()
+        for process in stragglers:
+            with suppress(psutil.NoSuchProcess):
+                process.kill()
 
 
 def test_a_failed_send_is_uncertain_and_keeps_no_agentapi_text(conversation):
     agy = conversation
     (agy.tmp / "agentapi.jsonl.fail").touch()
     _process, monitor = agy.run({"name": "start", "command": "echo one"})
+    monitors = Monitors(agy.state)
+    record = wait_for(
+        lambda: m if (m := monitors.get(monitor["monitor_id"]))["status"] == "completed" else None
+    )
+    # The output and the completion notice, both sent and both uncertain.
     events = wait_for(
         lambda: (
-            (found := agy.events())
+            len(found := agy.events()) == 2
             and all(event["status"] == "uncertain" for event in found)
             and found
         )
     )
+    assert events[0]["text"] == "one"
+    assert events[1]["text"].startswith(f"Monitor {monitor['monitor_id']} completed")
     assert all(event["error"] == "agentapi exited with status 1" for event in events)
+    # The worker exited, so its log is complete.
+    wait_for(lambda: lifetime_alive(record["pid"], record["start_token"]) is False)
     # agentapi printed the token in its error; neither the store nor the log keeps it.
     assert b"fixture-token" not in (agy.state / "runtime.sqlite3").read_bytes()
     assert b"fixture-token" not in (agy.state / f"{monitor['monitor_id']}.log").read_bytes()

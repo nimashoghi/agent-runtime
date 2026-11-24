@@ -9,10 +9,9 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-
-import psutil
 
 from agent_runtime import agy
 from agent_runtime.authority import without_agy
@@ -59,10 +58,18 @@ class Monitors:
         if row is None:
             raise KeyError("unknown monitor")
         value = json.loads(row[0])
-        gone = bool(value.get("pid")) and not _worker_alive(value)
-        if gone and value["status"] in {"running", "starting"}:
+        if (
+            value["status"] in {"running", "starting"}
+            and value.get("pid")
+            and not _worker_alive(value)
+        ):
             value = self._interrupt(monitor_id, value["pid"])
-        if gone and "start_token" in value.get("owner", {}):
+        if (
+            "start_token" in value.get("owner", {})
+            and value["status"] not in {"running", "starting"}
+            and value.get("pid")
+            and not _worker_alive(value)
+        ):
             # An agy worker delivers its own events; one that died while sending
             # (also its final notice, after the command's outcome) leaves its
             # batch neither sent nor pending. Repeating this changes nothing.
@@ -78,17 +85,35 @@ class Monitors:
     def _interrupt(
         self, monitor_id: str, pid: int | None, *, error: str = "monitor worker exited"
     ) -> dict[str, Any]:
-        """Record that the worker exited (or never started), unless it recorded a
-        PID or an outcome meanwhile: the check is in the write transaction."""
+        """Record that the worker exited (or never started), unless it recorded
+        another lifetime or an outcome meanwhile: the record is read again, and
+        the worker checked again, inside the write transaction."""
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
-            if value["status"] in {"running", "starting"} and value.get("pid") == pid:
+            if (
+                value["status"] in {"running", "starting"}
+                and value.get("pid") == pid
+                and (pid is None or not _worker_alive(value))
+            ):
                 value.update(status="interrupted", error=error, updated_at=time.time())
                 db.execute(
                     "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
                 )
+        return value
+
+    def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
+        """Record the worker's own process as running the monitor, or return None
+        when the monitor no longer waits for a worker (given up or failed)."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
+            value = json.loads(row[0])
+            if value["status"] != "starting":
+                return None
+            value.update(status="running", **lifetime, updated_at=time.time())
+            db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))
         return value
 
     def update(self, monitor_id: str, **fields: Any) -> dict[str, Any]:
@@ -186,44 +211,41 @@ class Monitors:
         environment = dict(os.environ) if provider == "agy" else without_agy(dict(os.environ))
         for name in ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET"):
             environment.pop(name, None)
-        child = None
+        # The worker records its own process when it starts (Monitors.begin), so
+        # nothing here can fail after it started.
         try:
             fd = os.open(
                 self.store.root / f"{identity}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
             )
-            with os.fdopen(fd, "ab", buffering=0) as output:
-                child = subprocess.Popen(
-                    [
-                        sys.executable,
-                        # An agy worker holds the session's token: no PYTHON*
-                        # variable, user site or working folder may choose its code.
-                        *(["-I"] if provider == "agy" else []),
-                        "-m",
-                        "agent_runtime.monitor_worker",
-                        str(self.store.root),
-                        identity,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=output,
-                    env=environment,
-                    cwd=self.store.root if provider == "agy" else None,
-                    start_new_session=True,
-                )
-            try:
-                created = psutil.Process(child.pid).create_time()
-            except psutil.NoSuchProcess:
-                child.wait()
-            else:
-                self.update(identity, pid=child.pid, process_created_at=created)
-        except Exception as error:
-            # A worker that started must not run on unseen: it stops its command
-            # on SIGTERM.
-            if child is not None and child.poll() is None:
-                child.terminate()
+        except OSError as error:
             self.update(identity, status="failed", error=str(error))
             raise
-        return self.get(identity)
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    # An agy worker holds the session's token: no PYTHON*
+                    # variable, user site or working folder may choose its code.
+                    *(["-I"] if provider == "agy" else []),
+                    "-m",
+                    "agent_runtime.monitor_worker",
+                    str(self.store.root),
+                    identity,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=fd,
+                stderr=fd,
+                env=environment,
+                cwd=self.store.root if provider == "agy" else None,
+                start_new_session=True,
+            )
+        except Exception as error:  # no worker started
+            self.update(identity, status="failed", error=str(error))
+            raise
+        finally:
+            with suppress(OSError):  # the worker has its own copy
+                os.close(fd)
+        return value
 
     def stop(self, monitor_id: str) -> dict[str, Any]:
         value = self.get(monitor_id)
