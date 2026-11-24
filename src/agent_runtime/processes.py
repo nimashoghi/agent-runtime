@@ -64,26 +64,31 @@ def presence_lock(session_id: str) -> Path:
 def holds(process: psutil.Process, lock: Path) -> bool:
     """Whether the process has the conversation's current lock file open.
 
-    On Linux the open file must also be the lock's current inode: psutil names a
-    lock that was replaced, and that an old process still holds open, by its
-    old path.
+    On Linux the open file must also be the lock's current inode, read after
+    the scan: psutil names a lock that was replaced, and that an old process
+    still holds open, by its old path, also when the replacement happens while
+    the open files are read.
     """
+    linux = sys.platform.startswith("linux")
+    opened: list[tuple[int, int] | None] = []
+    for file in process.open_files():
+        if Path(file.path).resolve() != lock:
+            continue
+        if not linux:
+            opened.append(None)
+            continue
+        try:
+            status = os.stat(f"/proc/{process.pid}/fd/{file.fd}")
+        except FileNotFoundError:  # closed meanwhile
+            continue
+        opened.append((status.st_dev, status.st_ino))
+    if not opened:
+        return False
     try:
         current = lock.stat()
     except FileNotFoundError:
         return False
-    for file in process.open_files():
-        if Path(file.path).resolve() != lock:
-            continue
-        if not sys.platform.startswith("linux"):
-            return True
-        try:
-            opened = os.stat(f"/proc/{process.pid}/fd/{file.fd}")
-        except FileNotFoundError:  # closed meanwhile
-            continue
-        if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
-            return True
-    return False
+    return not linux or (current.st_dev, current.st_ino) in opened
 
 
 def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
@@ -97,7 +102,7 @@ def agy_alive(pid: int, token: str, session_id: str) -> bool | None:
         held = holds(psutil.Process(pid), presence_lock(session_id))
     except psutil.NoSuchProcess:
         return False
-    except (psutil.AccessDenied, OSError):
+    except (psutil.AccessDenied, OSError, RuntimeError):  # RuntimeError: a symlink loop
         return None
     if not held:
         return False

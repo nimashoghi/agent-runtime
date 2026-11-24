@@ -45,7 +45,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 include = ["src"]
-
-# TEMP-LOCAL-SOURCE
-[tool.uv.sources]
-typed-agent-hooks = { path = "../typed-agent-hooks", editable = true }

@@ -39,7 +39,7 @@ requires-dist = [
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "platformdirs", specifier = ">=4,<5" },
     { name = "psutil", specifier = ">=7.1,<8" },
-    { name = "typed-agent-hooks", editable = "../typed-agent-hooks" },
+    { name = "typed-agent-hooks", specifier = ">=0.4,<0.5" },
 ]
 provides-extras = ["claude"]
 
@@ -951,19 +951,13 @@ wheels = [
 [[package]]
 name = "typed-agent-hooks"
 version = "0.4.0"
-source = { editable = "../typed-agent-hooks" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.8,<3" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "ruff", specifier = ">=0.15" },
-    { name = "ty", specifier = ">=0.0.50,<0.1" },
+sdist = { url = "https://files.pythonhosted.org/packages/06/7d/8b240f4682590e18382cb6867592a491c54b260b4f2a02af7a0a4c0fb374/typed_agent_hooks-0.4.0.tar.gz", hash = "sha256:6af6b7a6f801a0299546f54a63c393e53fd413bd7308d9c1d968eaaf682edd85", size = 23817, upload-time = "2026-11-24T19:01:47.73Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/2f/bd00479b67a3342063b38aee43416970ff6ab7bbfc25840ec71bfc07f138/typed_agent_hooks-0.4.0-py3-none-any.whl", hash = "sha256:92112841346dde5f79b542e6083e2b2ba9dbc51eef2b8ed740881f70bd01e554", size = 32712, upload-time = "2026-11-24T19:01:46.402Z" },
 ]
 
 [[package]]

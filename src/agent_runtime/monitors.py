@@ -105,12 +105,33 @@ class Monitors:
 
     def begin(self, monitor_id: str, **lifetime: Any) -> dict[str, Any] | None:
         """Record the worker's own process as running the monitor, or return None
-        when the monitor no longer waits for a worker (given up or failed)."""
+        when the monitor no longer waits for a worker (given up or failed).
+
+        Readers judge an agy worker by its start token, so an agy worker without
+        one fails here, with its event, in the same transaction.
+        """
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM monitors WHERE id=?", (monitor_id,)).fetchone()
             value = json.loads(row[0])
             if value["status"] != "starting":
+                return None
+            if "start_token" in value["owner"] and "start_token" not in lifetime:
+                error = "the monitor worker cannot read its start token"
+                value.update(status="failed", error=error, updated_at=time.time())
+                db.execute(
+                    "UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id)
+                )
+                db.execute(
+                    "INSERT INTO monitor_events(monitor_id,session_id,text,status,created) "
+                    "VALUES(?,?,?,'pending',?)",
+                    (
+                        monitor_id,
+                        value["session_id"],
+                        f"Monitor {monitor_id} failed: {error}",
+                        time.time(),
+                    ),
+                )
                 return None
             value.update(status="running", **lifetime, updated_at=time.time())
             db.execute("UPDATE monitors SET value=? WHERE id=?", (json.dumps(value), monitor_id))

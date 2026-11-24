@@ -95,28 +95,34 @@ def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> 
     """Record the live agy process of a conversation, from one of its hooks, for
     discovery; delivery does not read this record.
 
-    The write checks, in its transaction, that the lifetime still holds the
-    conversation, so that a late hook of an exited process cannot hide the
-    process that resumed it.
+    It writes only after it checked that the lifetime holds the conversation,
+    and only if no other hook wrote the record since the check began, so that a
+    late hook of an exited process cannot hide the process that resumed it. The
+    check runs outside the write transaction, which other writers share.
     """
     pid, token = native_process(session_id)
     registry = registry or Registry()
-    with registry.store.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
+    select = "SELECT value FROM sessions WHERE provider='agy' AND id=?"
+    for _attempt in range(3):
+        with registry.store.connect() as db:
+            before = (row := db.execute(select, (session_id,)).fetchone()) and row[0]
         if agy_alive(pid, token, session_id) is not True:
             return
-        row = db.execute(
-            "SELECT value FROM sessions WHERE provider='agy' AND id=?", (session_id,)
-        ).fetchone()
-        value: dict[str, Any] = (
-            json.loads(row[0]) if row else {"provider": "agy", "session_id": session_id}
-        )
-        value.update(cwd=cwd, pid=pid, native_start=token, updated_at=time.time())
-        db.execute(
-            "INSERT INTO sessions VALUES('agy',?,?) ON CONFLICT(provider,id) "
-            "DO UPDATE SET value=excluded.value",
-            (session_id, json.dumps(value)),
-        )
+        with registry.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(select, (session_id,)).fetchone()
+            if (row and row[0]) != before:
+                continue  # another hook wrote meanwhile: check again
+            value: dict[str, Any] = (
+                json.loads(row[0]) if row else {"provider": "agy", "session_id": session_id}
+            )
+            value.update(cwd=cwd, pid=pid, native_start=token, updated_at=time.time())
+            db.execute(
+                "INSERT INTO sessions VALUES('agy',?,?) ON CONFLICT(provider,id) "
+                "DO UPDATE SET value=excluded.value",
+                (session_id, json.dumps(value)),
+            )
+            return
 
 
 def live_sessions(registry: Registry | None = None) -> list[dict[str, Any]]:

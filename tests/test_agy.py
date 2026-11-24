@@ -15,7 +15,7 @@ import pytest
 from agent_runtime import operations
 from agent_runtime.hooks import app
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import lifetime_alive, start_token
+from agent_runtime.processes import holds, lifetime_alive, start_token
 from agent_runtime.sessions import (
     AmbiguousIdentity,
     IdentityUnavailable,
@@ -251,12 +251,14 @@ def test_a_command_wakes_its_own_session_and_keeps_the_token_out(conversation):
 
 def test_a_persistent_monitor_keeps_its_output_for_the_resumed_session(conversation):
     agy = conversation
-    first, monitor = agy.run(
-        {"name": "start", "command": "sleep 2; echo after-exit", "persistent": True}
-    )
+    gate = agy.tmp / "gate"
+    command = f"while [ ! -e {gate} ]; do sleep 0.05; done; echo after-exit"
+    first, monitor = agy.run({"name": "start", "command": command, "persistent": True})
     assert "error" not in monitor
     first.terminate()
     first.wait(timeout=5)
+    # The output comes only after the agy process is gone.
+    gate.touch()
     # The output and the completion notice wait: nothing can wake a session
     # whose agy process is gone.
     wait_for(
@@ -478,3 +480,57 @@ def test_the_public_operations_of_an_agy_session(conversation):
     assert all(call["agy"] == [] for call in calls)
     _process, (stopped,) = agy.run_all([{"name": "stop", "monitor_id": monitor["monitor_id"]}])
     assert stopped["stop_requested"] is True
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the inode check is Linux's")
+@pytest.mark.parametrize("during_scan", [False, True])
+def test_an_old_process_does_not_hold_a_replaced_presence_lock(tmp_path, during_scan):
+    lock = (tmp_path / "conversation.lock").resolve()
+    lock.touch()
+
+    def replace():
+        lock.unlink()
+        lock.touch()
+
+    with lock.open():
+        process = psutil.Process()
+        assert holds(process, lock)
+
+        class Scanning:
+            """The lock is replaced while the open files are read."""
+
+            pid = process.pid
+
+            def open_files(self):
+                files = process.open_files()
+                replace()
+                return files
+
+        if during_scan:
+            assert not holds(Scanning(), lock)  # pyright: ignore[reportArgumentType]
+        else:
+            replace()
+            assert not holds(process, lock)
+
+
+def test_an_agy_worker_without_a_start_token_fails_before_it_runs(tmp_path):
+    monitors = Monitors(tmp_path)
+    record = {
+        "monitor_id": "magy",
+        "session_id": "agy:c1",
+        "status": "starting",
+        "created_at": time.time(),
+        "owner": {"pid": 1, "start_token": "t", "conversation": "c1"},
+    }
+    with monitors.store.connect() as db:
+        db.execute("INSERT INTO monitors VALUES(?,?,?)", ("magy", "agy:c1", json.dumps(record)))
+
+    assert monitors.begin("magy", pid=os.getpid(), process_created_at=1.0) is None
+
+    failed = monitors.get("magy")
+    assert (failed["status"], failed["error"]) == (
+        "failed",
+        "the monitor worker cannot read its start token",
+    )
+    (event,) = monitors.events("agy:c1")
+    assert event["text"] == "Monitor magy failed: the monitor worker cannot read its start token"

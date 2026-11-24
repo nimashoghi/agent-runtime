@@ -4,10 +4,13 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar, cast
 
 import psutil
 
@@ -43,10 +46,6 @@ async def run(directory: Path, identity: str) -> None:
         lifetime["start_token"] = start_token(process)
     if (value := monitors.begin(identity, **lifetime)) is None:
         return  # given up or failed before this worker started
-    if "start_token" in value["owner"] and "start_token" not in lifetime:
-        # Readers judge an agy worker by its token, as the worker judges its owner.
-        monitors.update(identity, status="failed", error="the worker cannot read its start token")
-        return
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
@@ -61,9 +60,16 @@ async def run(directory: Path, identity: str) -> None:
     async def watch_owner() -> None:
         # In its own task, because inspecting an agy owner's open files can be
         # slow, and supervision must go on meanwhile.
-        while await asyncio.to_thread(owner_alive, owner):
+        while True:
+            try:
+                alive = await _in_thread(owner_alive, owner)
+            except Exception as error:  # inconclusive: ask again
+                print(f"monitor owner check: {type(error).__name__}: {error}", file=sys.stderr)
+                alive = True
+            if not alive:
+                stop.set()
+                return
             await asyncio.sleep(0.25)
-        stop.set()
 
     watcher = None if value["persistent"] else asyncio.create_task(watch_owner())
     child = None
@@ -71,6 +77,7 @@ async def run(directory: Path, identity: str) -> None:
     descendants = {}
     started = time.monotonic()
     timed_out = False
+    stopping = False  # supervision decided to stop the command
     readers = []
     try:
         # Stopping a command's descendants needs the process table.
@@ -140,6 +147,7 @@ async def run(directory: Path, identity: str) -> None:
             if state.get("stop_requested"):
                 stop.set()
             if stop.is_set():
+                stopping = True
                 if process_alive({"pid": child.pid, "process_created_at": child_created}):
                     os.killpg(child.pid, signal.SIGTERM)
                     if not await exited(child, 5) and process_alive(
@@ -165,7 +173,7 @@ async def run(directory: Path, identity: str) -> None:
             "timed_out"
             if timed_out
             else "stopped"
-            if stop.is_set()
+            if stopping
             else "completed"
             if child.returncode == 0
             else "failed"
@@ -173,6 +181,8 @@ async def run(directory: Path, identity: str) -> None:
         monitors.update(identity, status=status, exit_code=child.returncode)
         monitors.append(identity, f"Monitor {identity} {status} (exit code {child.returncode}).")
     except Exception as error:
+        if finish.deadline is None:
+            finish.deadline = time.monotonic() + FINAL_DELIVERY
         monitors.update(identity, status="failed", error=str(error))
         monitors.append(identity, f"Monitor {identity} failed: {error}")
         raise
@@ -196,8 +206,42 @@ async def run(directory: Path, identity: str) -> None:
             if finish.deadline is None:
                 finish.deadline = time.monotonic() + FINAL_DELIVERY
             finish.final = True
+            # Bounded, so that a stuck inspection or store cannot keep the
+            # worker, which holds the session's credentials: a send that
+            # started before the deadline gets agentapi's own timeout.
+            bound = finish.deadline - time.monotonic() + agy.AGENTAPI_TIMEOUT + 5
             with suppress(Exception):
-                await delivery
+                await asyncio.wait_for(delivery, timeout=max(bound, 0))
+
+
+T = TypeVar("T")
+
+
+async def _in_thread(function: Callable[..., T], *args: object) -> T:
+    """Run a blocking call in a daemon thread. Unlike asyncio.to_thread, a call
+    that never returns (an inspection of a stalled file system) cannot keep the
+    worker from exiting."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[T] = loop.create_future()
+
+    def settle(result: T | None, error: BaseException | None) -> None:
+        if future.done():  # cancelled meanwhile
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(cast(T, result))
+
+    def target() -> None:
+        try:
+            result, error = function(*args), None
+        except BaseException as caught:  # handed to the awaiting task
+            result, error = None, caught
+        with suppress(RuntimeError):  # the loop closed: nobody waits
+            loop.call_soon_threadsafe(settle, result, error)
+
+    threading.Thread(target=target, daemon=True).start()
+    return await future
 
 
 @dataclass
@@ -241,6 +285,8 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             monitors.settle(*unsettled[0])
             unsettled.pop(0)
         while True:
+            if late():  # before an inspection, which can be slow
+                return "closed"
             state = owner_state()
             if state is False or late():
                 return "closed"
@@ -262,7 +308,7 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
     while True:
         final = finish.final
         try:
-            result = await asyncio.to_thread(drain)
+            result = await _in_thread(drain)
         except Exception as error:  # a store error: report it and try again
             print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
             result = "retry"
