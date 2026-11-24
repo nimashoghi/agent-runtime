@@ -203,12 +203,14 @@ async def run(directory: Path, identity: str) -> None:
             status=status,
             exit_code=child.returncode,
         )
+        finish.wake.set()  # the notice goes out while the worker cleans up
     except Exception as error:
         if finish.deadline is None:
             finish.deadline = time.monotonic() + FINAL_DELIVERY
         monitors.finish(
             identity, f"Monitor {identity} failed: {error}", status="failed", error=str(error)
         )
+        finish.wake.set()
         raise
     finally:
         if watcher is not None:
@@ -349,39 +351,57 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             return False
 
     check: asyncio.Future[bool] | None = None  # at most one owner check at a time
-    while True:
-        final = finish.final
-        finish.wake.clear()  # before the drain, so that an event during it wakes the wait
-        try:
-            result = await _in_thread(drain)
-        except Exception as error:  # a store error: report it and try again
-            print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
-            result = "retry"
-        if result == "gone" or (final and (result != "retry" or late())):
-            # Nothing can wake a conversation whose process has exited; the
-            # events wait for monitor_events.
-            return
-        if result != "idle":
-            await asyncio.sleep(1)
-            continue
-        # Idle: wait for a recorded event or the end, which starts the next
-        # drain at once. After each IDLE_CHECK of silence, look whether the
-        # owner process has exited.
-        woken = asyncio.ensure_future(finish.wake.wait())
-        try:
-            while not woken.done():
-                if check is None:
-                    await asyncio.wait({woken}, timeout=IDLE_CHECK)
-                    if woken.done():
-                        break
-                    check = asyncio.ensure_future(owner_exited())
-                await asyncio.wait({woken, check}, return_when=asyncio.FIRST_COMPLETED)
-                if check.done():
-                    if check.result():
+
+    def exit_confirmed() -> bool:
+        """Whether the outstanding owner check has ended with the owner's exit;
+        a check that ended otherwise makes room for the next one."""
+        nonlocal check
+        if check is None or not check.done():
+            return False
+        exited = check.result()
+        check = None
+        return exited
+
+    try:
+        while True:
+            final = finish.final
+            finish.wake.clear()  # before the drain, so that an event during it wakes the wait
+            try:
+                result = await _in_thread(drain)
+            except Exception as error:  # a store error: report it and try again
+                print(f"monitor delivery: {type(error).__name__}: {error}", file=sys.stderr)
+                result = "retry"
+            if result == "gone" or (final and (result != "retry" or late())):
+                # Nothing can wake a conversation whose process has exited; the
+                # events wait for monitor_events.
+                return
+            if result != "idle":
+                # A check that confirmed the owner's exit meanwhile ends delivery,
+                # once no receipt waits to be written.
+                if not unsettled and exit_confirmed():
+                    return
+                await asyncio.sleep(1)
+                continue
+            # Idle: wait for an event that this worker records, or its end, which
+            # starts the next drain at once. (Only the worker records events
+            # while it runs.) After each IDLE_CHECK of silence, look whether the
+            # owner process has exited.
+            woken = asyncio.ensure_future(finish.wake.wait())
+            try:
+                while not woken.done():
+                    if check is None:
+                        await asyncio.wait({woken}, timeout=IDLE_CHECK)
+                        if woken.done():
+                            break
+                        check = asyncio.ensure_future(owner_exited())
+                    await asyncio.wait({woken, check}, return_when=asyncio.FIRST_COMPLETED)
+                    if exit_confirmed():
                         return
-                    check = None
-        finally:
-            woken.cancel()
+            finally:
+                woken.cancel()
+    finally:
+        if check is not None:
+            check.cancel()  # its daemon call ends by itself
 
 
 if __name__ == "__main__":

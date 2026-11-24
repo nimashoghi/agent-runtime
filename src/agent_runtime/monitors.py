@@ -362,6 +362,10 @@ class Monitors:
         return value
 
     def append(self, monitor_id: str, text: str) -> int:
+        """Record an observation of a monitor. Only the monitor's worker calls
+        this while the worker runs: an agy worker wakes its idle delivery when it
+        records one, and an event that another process recorded meanwhile waits
+        for the worker's next drain or for monitor_events."""
         value = self.get(monitor_id)
         with self.store.connect() as db:
             cursor = db.execute(

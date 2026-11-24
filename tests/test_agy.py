@@ -915,7 +915,8 @@ def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
     wait_for(lambda: not agy_module._LOOKUPS and not agy_module._INSPECTIONS)
 
 
-def test_an_interrupted_lookup_start_leaves_its_replacement_alone(monkeypatch):
+@pytest.mark.parametrize("registry", ["lookup", "inspection"])
+def test_an_interrupted_start_leaves_its_replacement_alone(monkeypatch, registry):
     for name, value in {
         "ANTIGRAVITY_CONVERSATION_ID": "c4",
         "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
@@ -924,37 +925,51 @@ def test_an_interrupted_lookup_start_leaves_its_replacement_alone(monkeypatch):
     }.items():
         monkeypatch.setenv(name, value)
     scans = []
+    scanning = threading.Event()
     release = threading.Event()
 
-    def native(session_id):
-        scans.append(session_id)
+    def scan(*_):
+        scans.append(1)
+        scanning.set()
         release.wait(5)
-        return (1, "t")
+        return (1, "t") if registry == "lookup" else True
 
-    monkeypatch.setattr(agy_module, "native_process", native)
+    monkeypatch.setattr(agy_module, "native_process", scan)
+    monkeypatch.setattr(agy_module, "agy_alive", scan)
+    entries = agy_module._LOOKUPS if registry == "lookup" else agy_module._INSPECTIONS
+    key = "c4" if registry == "lookup" else (4, "t", "c4")
+
+    def begin():
+        if registry == "lookup":
+            agy_module.command_owner("c4")
+        else:
+            agy_module._inspection(key)
+
     start = threading.Thread.start
+    abandoned = []
 
     def interrupted(thread):
         start(thread)  # the thread runs, and its starter is interrupted
+        abandoned.append(thread)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(threading.Thread, "start", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        agy_module.command_owner("c4")
+        begin()
     monkeypatch.setattr(threading.Thread, "start", start)
-    assert not agy_module._LOOKUPS
-    # A retry starts a replacement; the first thread neither scans nor removes it.
-    retry = threading.Thread(target=agy_module.command_owner, args=("c4",), daemon=True)
+    (first,) = abandoned
+    first.join(5)  # it found its entry gone and did nothing
+    assert not first.is_alive() and not entries and scans == []
+    # A replacement scans once and stays registered while it runs.
+    retry = threading.Thread(target=begin, daemon=True)
     retry.start()
-    wait_for(lambda: "c4" in agy_module._LOOKUPS)
-    time.sleep(0.2)
     try:
-        assert "c4" in agy_module._LOOKUPS
-        assert scans == ["c4"]
+        assert scanning.wait(5)
+        assert key in entries and scans == [1]
     finally:
         release.set()
         retry.join(5)
-    wait_for(lambda: not agy_module._LOOKUPS)
+    wait_for(lambda: not entries)
 
 
 def test_a_lookup_whose_thread_cannot_start_leaves_no_slot(monkeypatch):
@@ -1089,11 +1104,19 @@ def test_an_unreadable_boot_is_read_once(monkeypatch):
 
 
 def _idle_delivery(tmp_path, monkeypatch, monitor_id, owner_check):
+    """Run an agy delivery that goes idle, enters an owner check (which
+    owner_check makes fail or stall), and then gets an observation."""
     monitors = Monitors(tmp_path)
     record = _delivery_record(monitors, monitor_id)
     sent = []
+    entered = threading.Event()
+
+    def checking(*args):
+        entered.set()
+        return owner_check(*args)
+
     monkeypatch.setattr(monitor_worker, "IDLE_CHECK", 0.05)
-    monkeypatch.setattr(monitor_worker, "lifetime_alive", owner_check)
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", checking)
     monkeypatch.setattr(monitor_worker, "agy_alive", lambda *_: True)
 
     def send(conversation, _text, confirm):
@@ -1104,41 +1127,46 @@ def _idle_delivery(tmp_path, monkeypatch, monitor_id, owner_check):
     monkeypatch.setattr(monitor_worker.agy, "send_notice", send)
     finish = monitor_worker._Finish()
 
+    async def until(predicate):
+        for _ in range(200):
+            if predicate():
+                return
+            await asyncio.sleep(0.025)
+        raise AssertionError("condition did not become true")
+
     async def scenario():
         delivery = asyncio.ensure_future(
             monitor_worker._deliver(monitors, monitor_id, record["owner"], finish)
         )
-        await asyncio.sleep(0.3)  # idle checks run (and fail or stall)
+        await until(entered.is_set)
         monitors.append(monitor_id, "one")
         finish.wake.set()
-        for _ in range(100):
-            if sent:
-                break
-            await asyncio.sleep(0.05)
+        # Sent while the worker still runs, before its final pass.
+        await until(
+            lambda: (
+                [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]
+            )
+        )
+        assert not delivery.done()
         finish.deadline, finish.final = time.monotonic() + 30, True
         finish.wake.set()
         await asyncio.wait_for(delivery, 10)
 
     asyncio.run(scenario())
-    return monitors, sent
+    return sent
 
 
 def test_an_idle_check_that_fails_keeps_delivery(tmp_path, monkeypatch):
     def refused(*_):
         raise PermissionError("the owner cannot be inspected")
 
-    monitors, sent = _idle_delivery(tmp_path, monkeypatch, "mfail", refused)
-    assert sent == ["c1"]
-    assert [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]
+    assert _idle_delivery(tmp_path, monkeypatch, "mfail", refused) == ["c1"]
 
 
 def test_an_idle_check_that_stalls_does_not_hold_up_a_send(tmp_path, monkeypatch):
     stalled = threading.Event()
     try:
-        monitors, sent = _idle_delivery(
-            tmp_path, monkeypatch, "mstall", lambda *_: stalled.wait(30)
-        )
+        sent = _idle_delivery(tmp_path, monkeypatch, "mstall", lambda *_: stalled.wait(30))
     finally:
         stalled.set()
     assert sent == ["c1"]
-    assert [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]
