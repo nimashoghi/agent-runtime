@@ -16,6 +16,7 @@ import psutil
 
 from agent_runtime.authority import without_agy
 from agent_runtime.claude import process_alive
+from agent_runtime.processes import lifetime_alive
 from agent_runtime.sessions import Provider, Registry, current_identity, permission_class
 
 
@@ -26,6 +27,13 @@ def owner_key(provider: Provider, session_id: str) -> str:
     are prefixed, so that equal session IDs of two hosts never share monitors.
     """
     return session_id if provider == "claude_code" else f"{provider}:{session_id}"
+
+
+def _worker_alive(value: dict[str, Any]) -> bool:
+    """A worker that recorded its start token is judged by it, unchanged by clock steps."""
+    if token := value.get("start_token"):
+        return lifetime_alive(value["pid"], token) is not False
+    return process_alive(value)
 
 
 class Monitors:
@@ -52,7 +60,7 @@ class Monitors:
         if (
             value["status"] in {"running", "starting"}
             and value.get("pid")
-            and not process_alive(value)
+            and not _worker_alive(value)
         ):
             value = self.update(monitor_id, status="interrupted", error="monitor worker exited")
         if (
@@ -115,11 +123,20 @@ class Monitors:
             raise RuntimeError("current native process is not live")
         key = owner_key(provider, session_id)
         bridge = target.get("bridge")
-        if (
-            not isinstance(bridge, dict)
-            or not process_alive(bridge)
-            or bridge.get("native_pid") != target["pid"]
-        ):
+        if provider == "agy":
+            assert owner is not None
+            running = (
+                isinstance(bridge, dict)
+                and lifetime_alive(bridge.get("pid", 0), bridge.get("start_token", "")) is not False
+                and (bridge.get("native_pid"), bridge.get("native_start")) == owner
+            )
+        else:
+            running = (
+                isinstance(bridge, dict)
+                and process_alive(bridge)
+                and bridge.get("native_pid") == target["pid"]
+            )
+        if not running:
             start = (
                 "check agent-runtime hooks"
                 if provider == "claude_code"

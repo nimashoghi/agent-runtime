@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 import psutil
@@ -16,15 +15,22 @@ AGY_CONVERSATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 def start_token(process: psutil.Process) -> str:
     """When the process started, as a value that one process lifetime keeps.
 
-    psutil's create_time on Linux adds the start's clock ticks to a boot time
-    that it derives from the current clock, so a clock step changes it. The
-    ticks themselves do not change. macOS records the start time once.
+    This is psutil's own identity of a process lifetime (``Process._get_ident``):
+    the start that the kernel recorded, without the adjustment to the current
+    clock that the public create_time() makes, so a clock step leaves it alone.
     """
-    if sys.platform.startswith("linux"):
-        with open(f"/proc/{process.pid}/stat") as stat:
-            # Field 22, starttime; the command name in parentheses can hold spaces.
-            return "ticks:" + stat.read().rsplit(")", 1)[1].split()[19]
-    return f"time:{process.create_time()!r}"
+    platform_process = getattr(process, "_proc")  # noqa: B009 - psutil's private handle
+    return repr(platform_process.create_time(monotonic=True))
+
+
+def lifetime_alive(pid: int, token: str) -> bool | None:
+    """Whether the process of this lifetime runs; None when it cannot be inspected."""
+    try:
+        return start_token(psutil.Process(pid)) == token
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return None
 
 
 def agy_conversation(session_id: str) -> str:

@@ -8,7 +8,7 @@
 - `current_identity()` raises `AmbiguousIdentity` for an environment that has an agy conversation and a Claude, Codex or managed session, and `IdentityUnavailable` when there is none; both are `RuntimeError`s.
 - `monitor_get` and `monitor_stop` reject another session's monitor before they read its state.
 - `Monitors.start` takes `owner` (an agy process lifetime) and refuses an agy monitor without it; `Monitors.claim` takes an `owner` that it checks in its transaction. `agent_runtime.processes` holds the clock-independent process identity.
-- The monitor worker keeps running when the system denies it the process table; the process group still stops the command's descendants.
+- The monitor worker resets an inherited `SIGCHLD` disposition and records a start token, by which `Monitors.get` judges it without creation times.
 - An interrupted delivery records "delivery bridge exited during a delivery attempt".
 - Requires `typed-agent-hooks>=0.4,<0.5`.
 

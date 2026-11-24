@@ -12,7 +12,8 @@ message an agy session.
 One agy process lifetime is its PID with its start token (processes.start_token),
 and it is live while it keeps the conversation's presence lock file open. The
 session's record names that lifetime; every write that acts for the session
-checks the record in the same transaction.
+checks the record, and a registration checks the lifetime, in the same
+transaction.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -30,65 +32,91 @@ import psutil
 from filelock import FileLock
 
 from agent_runtime.authority import AGY_CREDENTIALS
-from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors, owner_key
 from agent_runtime.processes import (
     agy_alive,
     agy_conversation,
     holds,
+    lifetime_alive,
     presence_lock,
     start_token,
 )
 from agent_runtime.sessions import Registry
 
 AGENTAPI_TIMEOUT = 20  # seconds; a bridge that takes over waits longer for the lock
+LOCK_WAIT = 3 * AGENTAPI_TIMEOUT
 Owner = tuple[int, str]  # the PID and start token of one agy process lifetime
 
 
-def native_process(session_id: str) -> psutil.Process:
-    """The agy process of a conversation, among the ancestors of this process."""
+def native_process(session_id: str) -> Owner:
+    """The lifetime of the agy process of a conversation, among the ancestors of
+    this process. Its start token is read before and after the presence check,
+    so that a PID that changed hands in between is not taken."""
     lock = presence_lock(session_id)
     hidden = []
     child = psutil.Process()
+    child_start = float(start_token(child))
     # Parent by parent, without psutil's parent(), which lists every process.
     while (parent_pid := child.ppid()) > 0:
         try:
             parent = psutil.Process(parent_pid)
-        except psutil.NoSuchProcess:
+        except psutil.Error:
             break
         try:
-            if parent.create_time() > child.create_time():
-                break  # the parent exited and its PID was reused
+            before = start_token(parent)
+        except psutil.NoSuchProcess:
+            break
+        except psutil.AccessDenied:
+            hidden.append(parent_pid)
+            child = parent
+            continue
+        if float(before) > child_start:
+            break  # the parent exited and its PID was reused
+        try:
             if holds(parent, lock):
                 if parent.uids().real != os.getuid():
                     raise RuntimeError("native agy process belongs to a different user")
-                return parent
+                if start_token(parent) != before:
+                    raise RuntimeError("the agy process changed while it was checked")
+                return parent.pid, before
         except psutil.AccessDenied:
             hidden.append(parent_pid)
         except psutil.NoSuchProcess:
             break
-        child = parent
+        child, child_start = parent, float(before)
     unreadable = f"; could not read the open files of {hidden}" if hidden else ""
     raise RuntimeError(
         f"no ancestor of this process is the agy process of {session_id}{unreadable}"
     )
 
 
-def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> dict[str, Any]:
+def register(session_id: str, cwd: str, *, registry: Registry | None = None) -> None:
     """Record the live agy process of a conversation, from one of its hooks.
 
-    Only the process that holds the conversation's presence lock passes
-    native_process, so a late hook of an exited process registers nothing.
+    The write checks, in its transaction, that the lifetime still holds the
+    conversation, so that a late hook of an exited process cannot replace the
+    registration of the process that resumed it.
     """
-    process = native_process(session_id)
-    return (registry or Registry()).update(
-        "agy",
-        session_id,
-        cwd=cwd,
-        pid=process.pid,
-        process_created_at=process.create_time(),
-        native_start=start_token(process),
-    )
+    owner = native_process(session_id)
+    registry = registry or Registry()
+    with registry.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if agy_alive(*owner, session_id) is not True:
+            raise RuntimeError(f"the agy process of {session_id} no longer holds it")
+        row = db.execute(
+            "SELECT value FROM sessions WHERE provider='agy' AND id=?", (session_id,)
+        ).fetchone()
+        value: dict[str, Any] = (
+            json.loads(row[0]) if row else {"provider": "agy", "session_id": session_id}
+        )
+        if (value.get("pid"), value.get("native_start")) != owner:
+            value.pop("bridge", None)  # a bridge serves one lifetime
+        value.update(cwd=cwd, pid=owner[0], native_start=owner[1], updated_at=time.time())
+        db.execute(
+            "INSERT INTO sessions VALUES('agy',?,?) ON CONFLICT(provider,id) "
+            "DO UPDATE SET value=excluded.value",
+            (session_id, json.dumps(value)),
+        )
 
 
 def _names(value: dict[str, Any], owner: Owner) -> bool:
@@ -116,15 +144,20 @@ def live_sessions(registry: Registry | None = None) -> list[dict[str, Any]]:
     """The registered agy sessions whose agy process still holds the conversation."""
     with (registry or Registry()).store.connect() as db:
         rows = db.execute("SELECT value FROM sessions WHERE provider='agy'").fetchall()
+    records = [json.loads(row[0]) for row in rows]
     return [
         record
-        for row in rows
-        if agy_alive(
-            (record := json.loads(row[0])).get("pid", 0),
-            record.get("native_start", ""),
-            record["session_id"],
-        )
+        for record in records
+        if agy_alive(record.get("pid", 0), record.get("native_start", ""), record["session_id"])
     ]
+
+
+def _bridge_runs(bridge: Any, owner: Owner) -> bool:
+    return (
+        isinstance(bridge, dict)
+        and (bridge.get("native_pid"), bridge.get("native_start")) == owner
+        and lifetime_alive(bridge.get("pid", 0), bridge.get("start_token", "")) is not False
+    )
 
 
 def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> Owner:
@@ -138,9 +171,9 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> Owner
             "run this from a command of the agy session"
         )
     registry = registry or Registry()
-    native = native_process(session_id)
-    owner = (native.pid, start_token(native))
-    with FileLock(str(registry.store.root / f"bridge-start-agy-{session_id}.lock"), timeout=5):
+    owner = native_process(session_id)
+    lock = registry.store.root / f"bridge-start-agy-{session_id}.lock"
+    with FileLock(str(lock), timeout=LOCK_WAIT + 10):
         record = registry.get("agy", session_id)
         # The hooks register the agy process that runs this command (its
         # PreToolUse hook runs before the command); the bridge must deliver with
@@ -150,12 +183,7 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> Owner
                 "agent-runtime hooks have not registered this agy process; "
                 "check that .agents/hooks.json runs the agent-runtime hook on PreToolUse"
             )
-        bridge = record.get("bridge")
-        if (
-            isinstance(bridge, dict)
-            and process_alive(bridge)
-            and (bridge.get("native_pid"), bridge.get("native_start")) == owner
-        ):
+        if _bridge_runs(record.get("bridge"), owner):
             return owner
         root = registry.store.root
         log = root / f"bridge-agy-{session_id}.log"
@@ -180,24 +208,20 @@ def ensure_bridge(session_id: str, *, registry: Registry | None = None) -> Owner
                 cwd=root,
                 start_new_session=True,
             )
-        # A bridge that cannot import agent_runtime (an installation that needs
-        # the user site, which -I leaves out) exits at once.
-        try:
-            status = child.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-        else:
-            tail = log.read_text(errors="replace").strip().splitlines()[-1:] or ["no output"]
-            raise RuntimeError(f"the agy delivery bridge exited with status {status}: {tail[0]}")
-        bridge = {
-            "pid": child.pid,
-            "process_created_at": psutil.Process(child.pid).create_time(),
-            "native_pid": owner[0],
-            "native_start": owner[1],
-        }
-        if not _update_owned(registry, session_id, owner, bridge=bridge):
-            raise RuntimeError("the agy conversation moved to another agy process")
-    return owner
+        # The bridge records itself once it holds the delivery lock; an earlier
+        # bridge can hold that lock for one more agentapi call.
+        deadline = time.monotonic() + LOCK_WAIT + 5
+        while time.monotonic() < deadline:
+            bridge = registry.get("agy", session_id).get("bridge")
+            if isinstance(bridge, dict) and bridge.get("pid") == child.pid:
+                return owner
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        if child.poll() is None:
+            child.terminate()
+        tail = log.read_text(errors="replace").strip().splitlines()[-1:] or ["no output"]
+        raise RuntimeError(f"the agy delivery bridge did not start: {tail[0]}")
 
 
 def _notice(session_id: str, events: list[dict[str, Any]]) -> str:
@@ -251,17 +275,18 @@ def run(directory: Path, session_id: str, owner: Owner) -> None:
     def owns() -> bool | None:
         """True while the record names this lifetime and it holds the conversation;
         None when that cannot be told now."""
-        if not _names(registry.get("agy", session_id), owner):
-            return False
-        return agy_alive(owner[0], owner[1], session_id)
+        try:
+            if not _names(registry.get("agy", session_id), owner):
+                return False
+        except sqlite3.Error:
+            return None
+        return agy_alive(*owner, session_id)
 
-    # An earlier bridge may still finish one agentapi call before it sees that
-    # its agy process is gone.
-    with FileLock(str(directory / f"bridge-agy-{session_id}.lock"), timeout=3 * AGENTAPI_TIMEOUT):
+    with FileLock(str(directory / f"bridge-agy-{session_id}.lock"), timeout=LOCK_WAIT):
         process = psutil.Process()
         bridge = {
             "pid": process.pid,
-            "process_created_at": process.create_time(),
+            "start_token": start_token(process),
             "native_pid": owner[0],
             "native_start": owner[1],
         }
@@ -274,14 +299,20 @@ def run(directory: Path, session_id: str, owner: Owner) -> None:
                 continue
             # The claim checks the record in its own transaction, so a bridge
             # whose process was replaced meanwhile claims nothing.
-            if not (events := monitors.claim(key, owner=("agy", session_id, *owner))):
+            try:
+                events = monitors.claim(key, owner=("agy", session_id, *owner))
+            except sqlite3.Error:
+                time.sleep(1)
+                continue
+            if not events:
                 time.sleep(0.2)
                 continue
             if owns() is not True:
-                # The conversation moved or cannot be checked: leave the events
-                # to the bridge that delivers for it.
+                # The conversation moved or cannot be checked now: leave the
+                # events to the bridge that delivers for it, or to the next try.
                 for event in events:
                     monitors.delivered(event["id"], "pending")
+                time.sleep(1)
                 continue
             status, detail = _send(executable, session_id, _notice(session_id, events))
             for event in events:

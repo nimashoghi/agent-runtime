@@ -16,6 +16,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from agent_runtime.authority import AGY_CREDENTIALS, AGY_IDENTITY
 from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
 from agent_runtime.sessions import Registry, own_claude_registration, send_claude_peer
@@ -55,6 +56,9 @@ def inbox(tmp_path, monkeypatch):
 
         thread = threading.Thread(target=receive, daemon=True)
         thread.start()
+        # A suite run from an agy session must not hand its authority to the children.
+        for name in AGY_IDENTITY + AGY_CREDENTIALS:
+            monkeypatch.delenv(name, raising=False)
         owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
         sid = str(uuid.uuid4())
         for name, value in {
@@ -66,8 +70,6 @@ def inbox(tmp_path, monkeypatch):
         }.items():
             monkeypatch.setenv(name, value)
         monkeypatch.delenv("AGENT_SESSION_PROVIDER", raising=False)
-        # A suite run from an agy session must not see its conversation.
-        monkeypatch.delenv("ANTIGRAVITY_CONVERSATION_ID", raising=False)
         registry = Registry(tmp_path)
         own_claude_registration(sid, str(tmp_path), "bypassPermissions", registry=registry)
         bridge = subprocess.Popen(

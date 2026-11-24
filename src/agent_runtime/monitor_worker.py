@@ -12,7 +12,7 @@ import psutil
 
 from agent_runtime.claude import process_alive
 from agent_runtime.monitors import Monitors
-from agent_runtime.processes import owner_alive
+from agent_runtime.processes import owner_alive, start_token
 
 
 async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -28,11 +28,17 @@ async def exited(child: asyncio.subprocess.Process, timeout: float) -> bool:
 
 
 async def run(directory: Path, identity: str) -> None:
+    # An inherited SIG_IGN would let the kernel discard the command's exit status.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     monitors = Monitors(directory)
     value = monitors.get(identity)
     process = psutil.Process()
     monitors.update(
-        identity, status="running", pid=process.pid, process_created_at=process.create_time()
+        identity,
+        status="running",
+        pid=process.pid,
+        process_created_at=process.create_time(),
+        start_token=start_token(process),
     )
     stop = asyncio.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -90,12 +96,10 @@ async def run(directory: Path, identity: str) -> None:
         ]
         while child.returncode is None:
             if child_created is not None:
-                # A system that denies the process table leaves the process
-                # group as the only way to stop the command's descendants.
                 try:
                     for descendant in psutil.Process(child.pid).children(recursive=True):
                         descendants[descendant.pid] = descendant.create_time()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+                except psutil.NoSuchProcess:
                     pass
             state = monitors.get(identity)
             if not value["persistent"] and time.monotonic() - started >= value["timeout_ms"] / 1000:

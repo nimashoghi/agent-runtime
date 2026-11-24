@@ -74,6 +74,14 @@ try:
         )
     elif op["name"] == "list":
         result = operations.monitor_list()
+    elif op["name"] == "events":
+        result = operations.monitor_events(after=0)
+    elif op["name"] == "stop":
+        result = operations.monitor_stop(op["monitor_id"])
+    elif op["name"] == "agents":
+        result = operations.agents()
+    elif op["name"] == "send":
+        result = operations.send("codex", "thread-1", "hello")
     else:
         result = operations.monitor_get(op["monitor_id"])
 except Exception as error:
@@ -111,9 +119,23 @@ class Agy:
         agentapi = tmp_path / "agentapi-exe"
         agentapi.write_text(f"#!{sys.executable}\nRECORD = {str(self.record)!r}\n{AGENTAPI}")
         agentapi.chmod(0o755)
+        # A codexr that records its calls and whether it got any agy variable.
+        self.codexr_record = tmp_path / "codexr.jsonl"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "codexr").write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            f"with open({str(self.codexr_record)!r}, 'a') as record:\n"
+            "    agy = sorted(name for name in os.environ if name.startswith('ANTIGRAVITY_'))\n"
+            "    record.write(json.dumps({'argv': sys.argv[1:], 'agy': agy}) + '\\n')\n"
+            "listing = sys.argv[1:3] == ['agents', 'list']\n"
+            "print('[]' if listing else json.dumps({'status': 'queued'}))\n"
+        )
+        (bin_dir / "codexr").chmod(0o755)
         # Built from test values only, so that no caller's credentials leak in.
         self.hook_env = {
-            "PATH": os.environ["PATH"],
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(tmp_path / "home"),
             "AGENT_RUNTIME_DIRECTORY": str(tmp_path / "state"),
             "ANTIGRAVITY_CONVERSATION_ID": self.session_id,
@@ -132,7 +154,12 @@ class Agy:
     def run(self, op, *, hook=True, token="fixture-token"):
         """Start an agy process that runs a hook and then one command; return the
         process and the command's result."""
-        result = self.tmp / f"result-{next(self.results)}.json"
+        process, (result,) = self.run_all([op], hook=hook, token=token)
+        return process, result
+
+    def run_all(self, ops, *, hook=True, token="fixture-token"):
+        """Start one agy process that runs a hook and a command for each operation."""
+        results = [self.tmp / f"result-{next(self.results)}.json" for _ in ops]
         payload = {
             "conversationId": self.session_id,
             "transcriptPath": str(self.tmp / "transcript_full.jsonl"),
@@ -140,23 +167,27 @@ class Agy:
             "hookEventName": "PreToolUse",
             "toolCall": {"id": "call_1", "name": "run_command", "args": {"CommandLine": "x"}},
         }
-        steps = [{"argv": [sys.executable, "-c", HOOK, json.dumps(payload)], "env": self.hook_env}]
-        steps = steps if hook else []
-        command = [sys.executable, "-c", AGENT, str(result), json.dumps(op)]
-        steps.append(
-            {"argv": command, "env": {**self.command_env, "ANTIGRAVITY_CSRF_TOKEN": token}}
-        )
+        steps = []
+        for op, result in zip(ops, results, strict=True):
+            if hook:
+                hook_argv = [sys.executable, "-c", HOOK, json.dumps(payload)]
+                steps.append({"argv": hook_argv, "env": self.hook_env})
+            command = [sys.executable, "-c", AGENT, str(result), json.dumps(op)]
+            env = {**self.command_env, "ANTIGRAVITY_CSRF_TOKEN": token}
+            steps.append({"argv": command, "env": env})
         process = subprocess.Popen(
             [sys.executable, "-c", FAKE_AGY, str(self.lock)],
             stdin=subprocess.PIPE,
             text=True,
             env={"PATH": os.environ["PATH"]},
         )
+        assert process.stdin is not None
         process.stdin.write(json.dumps(steps))
         process.stdin.close()
         self.processes.append(process)
-        wait_for(result.exists)
-        return process, json.loads(result.read_text())
+        for result in results:
+            wait_for(result.exists)
+        return process, [json.loads(result.read_text()) for result in results]
 
     def calls(self):
         if not self.record.exists():
@@ -218,8 +249,9 @@ def test_a_resumed_session_gets_the_output_of_a_persistent_monitor(conversation)
     assert "error" not in monitor
     first.terminate()
     first.wait(timeout=5)
+    # The output and the completion notice wait for the resumed session.
     wait_for(
-        lambda: any(e["text"] == "after-resume" and e["status"] == "pending" for e in agy.events())
+        lambda: len(found := agy.events()) == 2 and all(e["status"] == "pending" for e in found)
     )
     assert not agy.calls()
     # A new agy process of the same conversation, with its own credentials,
@@ -227,7 +259,7 @@ def test_a_resumed_session_gets_the_output_of_a_persistent_monitor(conversation)
     second, listed = agy.run({"name": "list"}, token="fixture-token-2")
     assert [value["monitor_id"] for value in listed] == [monitor["monitor_id"]]
     wait_for(lambda: all(event["status"] == "transport-written" for event in agy.events()))
-    assert [call["token"] for call in agy.calls()] == ["second"]
+    assert agy.calls() and all(call["token"] == "second" for call in agy.calls())
     assert Registry(agy.state).get("agy", agy.session_id)["bridge"]["native_pid"] == second.pid
 
 
@@ -351,3 +383,29 @@ def test_no_identity_is_distinct_from_an_ambiguous_one(monkeypatch):
 def test_agent_runtime_cannot_send_to_an_agy_session():
     with pytest.raises(ValueError, match="cannot send to it"):
         operations.send("agy", str(uuid.uuid4()), "hello")
+
+
+def test_the_public_operations_of_an_agy_session(conversation):
+    agy = conversation
+    _process, (monitor, events, agents, sent) = agy.run_all(
+        [
+            {"name": "start", "command": "sleep 30", "persistent": True},
+            {"name": "events"},
+            {"name": "agents"},
+            {"name": "send"},
+        ]
+    )
+    assert "error" not in monitor
+    assert events == []
+    assert [value["session_id"] for value in agents if value["provider"] == "agy"] == [
+        agy.session_id
+    ]
+    assert sent == {"status": "queued", "provider": "codex"}
+    calls = [json.loads(line) for line in agy.codexr_record.read_text().splitlines()]
+    queued = [call for call in calls if call["argv"][:2] == ["agents", "queue"]]
+    assert len(queued) == 1 and queued[0]["argv"][2] == "thread-1"
+    assert queued[0]["argv"][3].startswith(f"Peer context from agy:{agy.session_id}.")
+    # codexr acts for Codex, never with the agy command's identity or credentials.
+    assert all(call["agy"] == [] for call in calls)
+    _process, (stopped,) = agy.run_all([{"name": "stop", "monitor_id": monitor["monitor_id"]}])
+    assert stopped["stop_requested"] is True
