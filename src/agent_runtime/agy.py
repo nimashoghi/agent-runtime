@@ -99,6 +99,13 @@ class _Lookup:
         self.thread = threading.Thread(target=self._run, args=(session_id,), daemon=True)
 
     def _run(self, session_id: str) -> None:
+        # A start that failed (after the thread began) removed this entry, and
+        # may have entered a replacement: then this thread does nothing.
+        with _LOOKUPS_LOCK:
+            owned = _LOOKUPS.get(session_id) is self
+        if not owned:
+            self.done.set()
+            return
         try:
             self.owner = native_process(session_id)
         except BaseException as error:  # handed to the callers
@@ -106,7 +113,8 @@ class _Lookup:
         finally:
             self.done.set()
             with _LOOKUPS_LOCK:
-                _LOOKUPS.pop(session_id, None)
+                if _LOOKUPS.get(session_id) is self:
+                    del _LOOKUPS[session_id]
 
 
 _LOOKUPS: dict[str, _Lookup] = {}
@@ -203,6 +211,13 @@ class _Inspection:
         self.thread = threading.Thread(target=self._run, args=key, daemon=True)
 
     def _run(self, pid: int, token: str, session_id: str) -> None:
+        key = (pid, token, session_id)
+        # As _Lookup: only the thread of the entry inspects and removes it.
+        with _INSPECTIONS_LOCK:
+            owned = _INSPECTIONS.get(key) is self
+        if not owned:
+            self.done.set()
+            return
         try:
             self.result = agy_alive(pid, token, session_id)
         except Exception:  # unknown
@@ -210,7 +225,8 @@ class _Inspection:
         finally:
             self.done.set()
             with _INSPECTIONS_LOCK:
-                _INSPECTIONS.pop((pid, token, session_id), None)
+                if _INSPECTIONS.get(key) is self:
+                    del _INSPECTIONS[key]
 
 
 # Inspections that run, at most _MAX_INSPECTIONS, so that discoveries that a

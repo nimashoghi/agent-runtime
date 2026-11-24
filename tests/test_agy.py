@@ -870,12 +870,16 @@ def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
         monkeypatch.setenv(name, value)
     release = threading.Event()
     monkeypatch.setattr(agy_module, "native_process", lambda _session_id: release.wait(5))
+    monkeypatch.setattr(agy_module, "agy_alive", lambda *_: release.wait(5))
     monkeypatch.setattr(agy_module, "OWNER_TIMEOUT", 0.1)
     try:
         for _ in range(3):
             with pytest.raises(RuntimeError, match="was not found"):
                 agy_module.command_owner("c2")
         assert len(agy_module._LOOKUPS) == 1
+        # An inspection of the key that the child inspects runs too.
+        assert agy_module._inspection((1, "t", "c9")) is not None
+        assert len(agy_module._INSPECTIONS) == 1
         # A child forked while both registry locks are held, and a lookup runs,
         # finds its own agy process and inspects one without them.
         with (
@@ -908,6 +912,48 @@ def test_owner_lookups_that_do_not_end_are_shared(monkeypatch):
         assert os.waitstatus_to_exitcode(ended[1]) == 0
     finally:
         release.set()
+    wait_for(lambda: not agy_module._LOOKUPS and not agy_module._INSPECTIONS)
+
+
+def test_an_interrupted_lookup_start_leaves_its_replacement_alone(monkeypatch):
+    for name, value in {
+        "ANTIGRAVITY_CONVERSATION_ID": "c4",
+        "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:1",
+        "ANTIGRAVITY_CSRF_TOKEN": "fixture-token",
+        "ANTIGRAVITY_AGENTAPI_EXE": "/bin/false",
+    }.items():
+        monkeypatch.setenv(name, value)
+    scans = []
+    release = threading.Event()
+
+    def native(session_id):
+        scans.append(session_id)
+        release.wait(5)
+        return (1, "t")
+
+    monkeypatch.setattr(agy_module, "native_process", native)
+    start = threading.Thread.start
+
+    def interrupted(thread):
+        start(thread)  # the thread runs, and its starter is interrupted
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading.Thread, "start", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        agy_module.command_owner("c4")
+    monkeypatch.setattr(threading.Thread, "start", start)
+    assert not agy_module._LOOKUPS
+    # A retry starts a replacement; the first thread neither scans nor removes it.
+    retry = threading.Thread(target=agy_module.command_owner, args=("c4",), daemon=True)
+    retry.start()
+    wait_for(lambda: "c4" in agy_module._LOOKUPS)
+    time.sleep(0.2)
+    try:
+        assert "c4" in agy_module._LOOKUPS
+        assert scans == ["c4"]
+    finally:
+        release.set()
+        retry.join(5)
     wait_for(lambda: not agy_module._LOOKUPS)
 
 
@@ -1023,12 +1069,11 @@ def test_an_expired_final_pass_reads_nothing(tmp_path, monkeypatch):
     monitors = Monitors(tmp_path)
     record = _delivery_record(monitors, "mlate2")
 
-    def unexpected(_monitor_id):
-        raise AssertionError("read the store after the deadline")
-
-    monkeypatch.setattr(monitors, "has_pending", unexpected)
+    reads = []
+    monkeypatch.setattr(monitors, "has_pending", lambda monitor_id: reads.append(monitor_id))
     finish = monitor_worker._Finish(deadline=time.monotonic() - 1, final=True)
     asyncio.run(monitor_worker._deliver(monitors, "mlate2", record["owner"], finish))
+    assert reads == []
 
 
 def test_an_unreadable_boot_is_read_once(monkeypatch):
@@ -1041,3 +1086,59 @@ def test_an_unreadable_boot_is_read_once(monkeypatch):
     monkeypatch.setattr(processes, "boot_id", unreadable)
     assert processes.lifetime_alive(os.getpid(), "some-boot:1.0") is None
     assert reads == [1]
+
+
+def _idle_delivery(tmp_path, monkeypatch, monitor_id, owner_check):
+    monitors = Monitors(tmp_path)
+    record = _delivery_record(monitors, monitor_id)
+    sent = []
+    monkeypatch.setattr(monitor_worker, "IDLE_CHECK", 0.05)
+    monkeypatch.setattr(monitor_worker, "lifetime_alive", owner_check)
+    monkeypatch.setattr(monitor_worker, "agy_alive", lambda *_: True)
+
+    def send(conversation, _text, confirm):
+        assert confirm()
+        sent.append(conversation)
+        return "transport-written", None
+
+    monkeypatch.setattr(monitor_worker.agy, "send_notice", send)
+    finish = monitor_worker._Finish()
+
+    async def scenario():
+        delivery = asyncio.ensure_future(
+            monitor_worker._deliver(monitors, monitor_id, record["owner"], finish)
+        )
+        await asyncio.sleep(0.3)  # idle checks run (and fail or stall)
+        monitors.append(monitor_id, "one")
+        finish.wake.set()
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.05)
+        finish.deadline, finish.final = time.monotonic() + 30, True
+        finish.wake.set()
+        await asyncio.wait_for(delivery, 10)
+
+    asyncio.run(scenario())
+    return monitors, sent
+
+
+def test_an_idle_check_that_fails_keeps_delivery(tmp_path, monkeypatch):
+    def refused(*_):
+        raise PermissionError("the owner cannot be inspected")
+
+    monitors, sent = _idle_delivery(tmp_path, monkeypatch, "mfail", refused)
+    assert sent == ["c1"]
+    assert [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]
+
+
+def test_an_idle_check_that_stalls_does_not_hold_up_a_send(tmp_path, monkeypatch):
+    stalled = threading.Event()
+    try:
+        monitors, sent = _idle_delivery(
+            tmp_path, monkeypatch, "mstall", lambda *_: stalled.wait(30)
+        )
+    finally:
+        stalled.set()
+    assert sent == ["c1"]
+    assert [event["status"] for event in monitors.events("agy:c1")] == ["transport-written"]

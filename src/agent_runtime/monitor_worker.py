@@ -340,6 +340,15 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
             if status == "pending":
                 return "retry"
 
+    async def owner_exited() -> bool:
+        # Without a scan of its files; a check that fails is inconclusive.
+        try:
+            return await _in_thread(lifetime_alive, owner["pid"], owner["start_token"]) is False
+        except Exception as error:
+            print(f"monitor owner check: {type(error).__name__}: {error}", file=sys.stderr)
+            return False
+
+    check: asyncio.Future[bool] | None = None  # at most one owner check at a time
     while True:
         final = finish.final
         finish.wake.clear()  # before the drain, so that an event during it wakes the wait
@@ -355,14 +364,24 @@ async def _deliver(monitors: Monitors, identity: str, owner: dict, finish: _Fini
         if result != "idle":
             await asyncio.sleep(1)
             continue
-        # Idle: wait for an event or the end, and look now and then (without a
-        # scan of its files) whether the owner process has exited.
+        # Idle: wait for a recorded event or the end, which starts the next
+        # drain at once. After each IDLE_CHECK of silence, look whether the
+        # owner process has exited.
+        woken = asyncio.ensure_future(finish.wake.wait())
         try:
-            await asyncio.wait_for(finish.wake.wait(), timeout=IDLE_CHECK)
-        except TimeoutError:
-            ended = await _in_thread(lifetime_alive, owner["pid"], owner["start_token"])
-            if ended is False:
-                return
+            while not woken.done():
+                if check is None:
+                    await asyncio.wait({woken}, timeout=IDLE_CHECK)
+                    if woken.done():
+                        break
+                    check = asyncio.ensure_future(owner_exited())
+                await asyncio.wait({woken, check}, return_when=asyncio.FIRST_COMPLETED)
+                if check.done():
+                    if check.result():
+                        return
+                    check = None
+        finally:
+            woken.cancel()
 
 
 if __name__ == "__main__":
